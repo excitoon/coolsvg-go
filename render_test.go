@@ -40,6 +40,23 @@ func TestLinearGradientUsesObjectBounds(t *testing.T) {
 	}
 }
 
+func TestUserSpaceGradientPercentageDefaultsUseViewport(t *testing.T) {
+	t.Parallel()
+
+	icon := mustReadSVG(t, `<svg viewBox="0 0 10 2">
+<defs><linearGradient id="g" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs>
+<rect width="10" height="2" fill="url(#g)"/>
+</svg>`)
+	img := image.NewNRGBA(image.Rect(0, 0, 10, 2))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	left, right := img.NRGBAAt(0, 1), img.NRGBAAt(9, 1)
+	if left.R <= left.B || right.B <= right.R {
+		t.Fatalf("gradient endpoints = %#v and %#v", left, right)
+	}
+}
+
 func TestStrokeWithRoundCaps(t *testing.T) {
 	t.Parallel()
 

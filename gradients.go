@@ -129,6 +129,20 @@ func (r *renderer) resolveGradient(n *node, visiting map[*node]bool) (gradientDe
 	}
 	if units := strings.ToLower(n.attr("gradientunits")); units == "userspaceonuse" || units == "objectboundingbox" {
 		definition.units = units
+		if units == "userspaceonuse" {
+			if _, inherited := referenceID(n.href()); !inherited {
+				if n.tag == "lineargradient" {
+					definition.values["x1"], definition.values["y1"] = "0", "0"
+					definition.values["x2"], definition.values["y2"] = fmt.Sprintf("%.17g", r.icon.ViewBox.W), "0"
+				} else {
+					definition.values["cx"] = fmt.Sprintf("%.17g", r.icon.ViewBox.W/2)
+					definition.values["cy"] = fmt.Sprintf("%.17g", r.icon.ViewBox.H/2)
+					definition.values["r"] = fmt.Sprintf("%.17g", math.Hypot(r.icon.ViewBox.W, r.icon.ViewBox.H)/(2*math.Sqrt2))
+					definition.values["fx"], definition.values["fy"] = definition.values["cx"], definition.values["cy"]
+					definition.values["fr"] = "0"
+				}
+			}
+		}
 		// Re-normalize this node's coordinates after reading its units.
 		for _, name := range []string{"x1", "y1", "x2", "y2", "cx", "cy", "r", "fx", "fy", "fr"} {
 			if value := n.attr(name); value != "" {

@@ -126,6 +126,16 @@ func (r *renderer) renderContent(dst stddraw.Image, n *node, style computedStyle
 		err = r.renderNode(dst, target, style, ctm.Mul(translate(x, y)), viewport, 1)
 		delete(r.useStack, target)
 		return err
+	case "symbol":
+		if !r.useStack[n] {
+			return nil
+		}
+		for _, child := range n.children {
+			if err := r.renderNode(dst, child, style, ctm, viewport, 1); err != nil {
+				return err
+			}
+		}
+		return nil
 	case "path", "rect", "circle", "ellipse", "line", "polyline", "polygon":
 		if !style.visible {
 			return nil
