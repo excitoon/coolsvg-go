@@ -25,8 +25,11 @@ type Matrix struct {
 	F float64
 }
 
-// Identity is the identity transformation.
-var Identity = Matrix{A: 1, D: 1}
+// Identity is the identity transformation. Internal rendering uses an
+// immutable value so reassignment by a caller cannot affect parsed icons.
+var Identity = identityMatrix()
+
+func identityMatrix() Matrix { return Matrix{A: 1, D: 1} }
 
 // Mul returns m*n: n is applied first, followed by m.
 func (m Matrix) Mul(n Matrix) Matrix {
@@ -50,17 +53,30 @@ func (m Matrix) Apply(p Point) Point {
 
 func (m Matrix) inverse() (Matrix, bool) {
 	det := m.A*m.D - m.B*m.C
-	if math.Abs(det) < 1e-15 {
+	if det == 0 || math.IsNaN(det) || math.IsInf(det, 0) {
 		return Matrix{}, false
 	}
-	return Matrix{
+	result := Matrix{
 		A: m.D / det,
 		B: -m.B / det,
 		C: -m.C / det,
 		D: m.A / det,
 		E: (m.C*m.F - m.D*m.E) / det,
 		F: (m.B*m.E - m.A*m.F) / det,
-	}, true
+	}
+	if !result.finite() {
+		return Matrix{}, false
+	}
+	return result, true
+}
+
+func (m Matrix) finite() bool {
+	for _, value := range [...]float64{m.A, m.B, m.C, m.D, m.E, m.F} {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 func translate(x, y float64) Matrix { return Matrix{A: 1, D: 1, E: x, F: y} }
@@ -72,7 +88,7 @@ func rotate(radians float64) Matrix {
 }
 
 func parseTransform(value string) (Matrix, error) {
-	m := Identity
+	m := identityMatrix()
 	for pos := 0; ; {
 		for pos < len(value) && (unicode.IsSpace(rune(value[pos])) || value[pos] == ',') {
 			pos++
@@ -152,6 +168,9 @@ func parseTransform(value string) (Matrix, error) {
 			return Matrix{}, fmt.Errorf("svg: unsupported transform %q", name)
 		}
 		m = m.Mul(n)
+		if !m.finite() {
+			return Matrix{}, fmt.Errorf("svg: non-finite transform %q", value)
+		}
 	}
 }
 
@@ -231,13 +250,22 @@ func (p *Path) flatten(m Matrix, tolerance float64) []contour {
 			here, start = s.p[0], s.p[0]
 			appendPoint(here)
 		case lineTo:
+			if len(cur.points) == 0 {
+				appendPoint(here)
+			}
 			here = s.p[0]
 			appendPoint(here)
 		case quadTo:
+			if len(cur.points) == 0 {
+				appendPoint(here)
+			}
 			p0, p1, p2 := m.Apply(here), m.Apply(s.p[0]), m.Apply(s.p[1])
 			flattenQuad(&cur.points, p0, p1, p2, tolerance, 0)
 			here = s.p[1]
 		case cubicTo:
+			if len(cur.points) == 0 {
+				appendPoint(here)
+			}
 			p0, p1, p2, p3 := m.Apply(here), m.Apply(s.p[0]), m.Apply(s.p[1]), m.Apply(s.p[2])
 			flattenCubic(&cur.points, p0, p1, p2, p3, tolerance, 0)
 			here = s.p[2]
@@ -247,6 +275,7 @@ func (p *Path) flatten(m Matrix, tolerance float64) []contour {
 				cur.closed = true
 			}
 			here = start
+			flush()
 		}
 	}
 	flush()
@@ -254,7 +283,9 @@ func (p *Path) flatten(m Matrix, tolerance float64) []contour {
 }
 
 func flattenQuad(dst *[]Point, p0, p1, p2 Point, tolerance float64, depth int) {
-	if depth >= 16 || distanceToLine(p1, p0, p2) <= tolerance {
+	polygonLength := math.Hypot(p1.X-p0.X, p1.Y-p0.Y) + math.Hypot(p2.X-p1.X, p2.Y-p1.Y)
+	chordLength := math.Hypot(p2.X-p0.X, p2.Y-p0.Y)
+	if depth >= 16 || polygonLength-chordLength <= tolerance {
 		if len(*dst) == 0 || !almostEqual((*dst)[len(*dst)-1], p2) {
 			*dst = append(*dst, p2)
 		}
@@ -267,8 +298,9 @@ func flattenQuad(dst *[]Point, p0, p1, p2 Point, tolerance float64, depth int) {
 }
 
 func flattenCubic(dst *[]Point, p0, p1, p2, p3 Point, tolerance float64, depth int) {
-	flat := math.Max(distanceToLine(p1, p0, p3), distanceToLine(p2, p0, p3))
-	if depth >= 16 || flat <= tolerance {
+	polygonLength := math.Hypot(p1.X-p0.X, p1.Y-p0.Y) + math.Hypot(p2.X-p1.X, p2.Y-p1.Y) + math.Hypot(p3.X-p2.X, p3.Y-p2.Y)
+	chordLength := math.Hypot(p3.X-p0.X, p3.Y-p0.Y)
+	if depth >= 16 || polygonLength-chordLength <= tolerance {
 		if len(*dst) == 0 || !almostEqual((*dst)[len(*dst)-1], p3) {
 			*dst = append(*dst, p3)
 		}
@@ -343,6 +375,16 @@ func (s *numberScanner) number() (float64, error) {
 	return v, nil
 }
 
+func (s *numberScanner) flag() (bool, error) {
+	s.skip()
+	if s.pos >= len(s.s) || s.s[s.pos] != '0' && s.s[s.pos] != '1' {
+		return false, fmt.Errorf("expected arc flag at byte %d", s.pos)
+	}
+	value := s.s[s.pos] == '1'
+	s.pos++
+	return value, nil
+}
+
 func parseNumberList(value string) ([]float64, error) {
 	s := numberScanner{s: value}
 	var out []float64
@@ -398,6 +440,9 @@ func ParsePath(data string) (*Path, error) {
 		}
 		lower := byte(unicode.ToLower(rune(cmd)))
 		relative := cmd >= 'a' && cmd <= 'z'
+		if len(p.segments) == 0 && lower != 'm' {
+			return nil, fmt.Errorf("svg path: first command must be M or m")
+		}
 		if lower == 'z' {
 			p.close()
 			here = start
@@ -537,19 +582,19 @@ func ParsePath(data string) (*Path, error) {
 				if err != nil {
 					return nil, fmt.Errorf("svg path A: %w", err)
 				}
-				large, err := next()
-				if err != nil || large != 0 && large != 1 {
+				large, err := s.flag()
+				if err != nil {
 					return nil, fmt.Errorf("svg path A: large-arc flag must be 0 or 1")
 				}
-				sweep, err := next()
-				if err != nil || sweep != 0 && sweep != 1 {
+				sweep, err := s.flag()
+				if err != nil {
 					return nil, fmt.Errorf("svg path A: sweep flag must be 0 or 1")
 				}
 				v, err := pair(relative)
 				if err != nil {
 					return nil, fmt.Errorf("svg path A: %w", err)
 				}
-				p.arcTo(here, v, rx, ry, angle, large == 1, sweep == 1)
+				p.arcTo(here, v, rx, ry, angle, large, sweep)
 				here = v
 				previous = lower
 			}

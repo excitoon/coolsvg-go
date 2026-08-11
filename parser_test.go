@@ -1,6 +1,7 @@
 package coolsvg
 
 import (
+	"image"
 	"image/color"
 	"strings"
 	"testing"
@@ -48,6 +49,28 @@ func TestParserRejectsDoctype(t *testing.T) {
 	_, err := ReadIconStream(strings.NewReader(`<!DOCTYPE svg><svg viewBox="0 0 10 10"/>`))
 	if err == nil || !strings.Contains(err.Error(), "document type") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestForeignNamespaceCannotSmuggleSVGGeometry(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg xmlns="http://www.w3.org/2000/svg" xmlns:x="urn:foreign" viewBox="0 0 4 4"><x:path d="M0 0H4V4H0Z"/></svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), IgnoreErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	for i := 3; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0 {
+			t.Fatal("foreign path was rendered as SVG geometry")
+		}
+	}
+	if _, err := ReadIconStream(strings.NewReader(source), StrictErrorMode); err == nil {
+		t.Fatal("strict mode accepted a foreign element")
 	}
 }
 
@@ -99,11 +122,11 @@ func TestReadReplacingCurrentColor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	style, err := icon.computeStyle(icon.root.children[0], defaultComputedStyle())
-	if err != nil {
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	if err := icon.Render(img); err != nil {
 		t.Fatal(err)
 	}
-	if style.fill.color != (color.NRGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff}) {
-		t.Fatalf("fill = %#v", style.fill.color)
+	if got := img.NRGBAAt(0, 0); got != (color.NRGBA{R: 0x12, G: 0x34, B: 0x56, A: 0xff}) {
+		t.Fatalf("fill = %#v", got)
 	}
 }

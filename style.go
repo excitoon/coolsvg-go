@@ -48,6 +48,8 @@ type computedStyle struct {
 	miterLimit    float64
 	dashArray     []float64
 	dashOffset    float64
+	clipRef       string
+	hasClip       bool
 	visible       bool
 	display       bool
 }
@@ -70,10 +72,17 @@ func defaultComputedStyle() computedStyle {
 
 type cssRule struct {
 	selector     string
-	declarations map[string]string
+	declarations declarations
 	specificity  int
 	order        int
 }
+
+type declaration struct {
+	value     string
+	important bool
+}
+
+type declarations map[string]declaration
 
 func parseCSS(source string) ([]cssRule, error) {
 	for {
@@ -114,6 +123,8 @@ func parseCSS(source string) ([]cssRule, error) {
 				specificity = 100
 			} else if selector[0] == '.' {
 				specificity = 10
+			} else if selector == "*" {
+				specificity = 0
 			}
 			rules = append(rules, cssRule{selector: selector, declarations: declarations, specificity: specificity, order: order})
 			order++
@@ -123,8 +134,8 @@ func parseCSS(source string) ([]cssRule, error) {
 	return rules, nil
 }
 
-func parseDeclarations(source string) (map[string]string, error) {
-	declarations := make(map[string]string)
+func parseDeclarations(source string) (declarations, error) {
+	result := make(declarations)
 	for _, item := range strings.Split(source, ";") {
 		item = strings.TrimSpace(item)
 		if item == "" {
@@ -136,12 +147,16 @@ func parseDeclarations(source string) (map[string]string, error) {
 		}
 		name = strings.ToLower(strings.TrimSpace(name))
 		value = strings.TrimSpace(value)
-		if important := strings.LastIndex(strings.ToLower(value), "!important"); important >= 0 {
-			value = strings.TrimSpace(value[:important])
+		important := false
+		if marker := strings.LastIndex(strings.ToLower(value), "!important"); marker >= 0 && strings.EqualFold(strings.TrimSpace(value[marker:]), "!important") {
+			value = strings.TrimSpace(value[:marker])
+			important = true
 		}
-		declarations[name] = value
+		if previous, ok := result[name]; !ok || important || !previous.important {
+			result[name] = declaration{value: value, important: important}
+		}
 	}
-	return declarations, nil
+	return result, nil
 }
 
 func (r cssRule) matches(n *node) bool {
@@ -167,7 +182,7 @@ var presentationProperties = []string{
 	"color", "fill", "fill-opacity", "fill-rule", "stroke", "stroke-opacity",
 	"stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
 	"stroke-dasharray", "stroke-dashoffset", "clip-rule", "opacity", "display",
-	"visibility",
+	"visibility", "clip-path",
 }
 
 func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, error) {
@@ -176,6 +191,15 @@ func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, er
 	// not inherited by its children.
 	style.opacity = 1
 	style.display = true
+	style.clipRef = ""
+	style.hasClip = false
+	for _, property := range presentationProperties {
+		if value := n.attr(property); value != "" {
+			if err := applyDeclaration(&style, parent, property, value); err != nil {
+				return style, err
+			}
+		}
+	}
 
 	var matching []cssRule
 	for _, rule := range s.css {
@@ -190,32 +214,38 @@ func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, er
 		return matching[i].specificity < matching[j].specificity
 	})
 	for _, rule := range matching {
-		if err := applyDeclarations(&style, parent, rule.declarations); err != nil {
+		if err := applyDeclarations(&style, parent, rule.declarations, false); err != nil {
 			return style, err
 		}
 	}
-	for _, property := range presentationProperties {
-		if value := n.attr(property); value != "" {
-			if err := applyDeclaration(&style, parent, property, value); err != nil {
-				return style, err
-			}
-		}
-	}
+	var inline declarations
 	if raw := n.attr("style"); raw != "" {
 		declarations, err := parseDeclarations(raw)
 		if err != nil {
 			return style, err
 		}
-		if err := applyDeclarations(&style, parent, declarations); err != nil {
+		inline = declarations
+		if err := applyDeclarations(&style, parent, declarations, false); err != nil {
 			return style, err
 		}
+	}
+	for _, rule := range matching {
+		if err := applyDeclarations(&style, parent, rule.declarations, true); err != nil {
+			return style, err
+		}
+	}
+	if err := applyDeclarations(&style, parent, inline, true); err != nil {
+		return style, err
 	}
 	return style, nil
 }
 
-func applyDeclarations(style *computedStyle, parent computedStyle, declarations map[string]string) error {
-	for name, value := range declarations {
-		if err := applyDeclaration(style, parent, name, value); err != nil {
+func applyDeclarations(style *computedStyle, parent computedStyle, declarations declarations, important bool) error {
+	for name, declaration := range declarations {
+		if declaration.important != important {
+			continue
+		}
+		if err := applyDeclaration(style, parent, name, declaration.value); err != nil {
 			return err
 		}
 	}
@@ -246,6 +276,8 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 			style.visible = parent.visible
 		case "display":
 			style.display = parent.display
+		case "clip-path":
+			style.clipRef, style.hasClip = parent.clipRef, parent.hasClip
 		}
 		return nil
 	}
@@ -352,6 +384,18 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 		style.display = !strings.EqualFold(value, "none")
 	case "visibility":
 		style.visible = !strings.EqualFold(value, "hidden") && !strings.EqualFold(value, "collapse")
+	case "clip-path":
+		style.clipRef, style.hasClip = "", false
+		value = strings.TrimSpace(value)
+		if strings.EqualFold(value, "none") || value == "" {
+			break
+		}
+		if strings.HasPrefix(strings.ToLower(value), "url(") && strings.HasSuffix(value, ")") {
+			ref := strings.Trim(strings.TrimSpace(value[4:len(value)-1]), "\"'")
+			if strings.HasPrefix(ref, "#") && len(ref) > 1 {
+				style.clipRef, style.hasClip = ref[1:], true
+			}
+		}
 	}
 	return nil
 }

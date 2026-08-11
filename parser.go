@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"image/color"
 	"io"
 	"log"
 	"math"
@@ -39,12 +40,14 @@ type SvgIcon struct {
 	Titles       []string
 	Descriptions []string
 
-	root      *node
-	ids       map[string]*node
-	css       []cssRule
-	target    Matrix
-	warnings  []string
-	errorMode ErrorMode
+	root         *node
+	ids          map[string]*node
+	css          []cssRule
+	target       Matrix
+	warnings     []string
+	warningSet   map[string]struct{}
+	errorMode    ErrorMode
+	currentColor *color.NRGBA
 }
 
 // Warnings returns a copy of non-fatal parse warnings.
@@ -65,13 +68,14 @@ func (s *SvgIcon) SetTarget(x, y, width, height float64) {
 }
 
 type node struct {
-	tag       string
-	attrs     map[string]string
-	children  []*node
-	parent    *node
-	path      *Path
-	transform Matrix
-	text      strings.Builder
+	tag         string
+	attrs       map[string]string
+	children    []*node
+	parent      *node
+	path        *Path
+	transform   Matrix
+	text        strings.Builder
+	unsupported bool
 }
 
 func (n *node) attr(name string) string { return n.attrs[strings.ToLower(name)] }
@@ -104,13 +108,23 @@ var supportedElements = map[string]bool{
 	"metadata": true,
 }
 
+const svgNamespace = "http://www.w3.org/2000/svg"
+
 const (
 	maxSVGDepth    = 512
 	maxSVGElements = 1_000_000
+	maxSVGBytes    = 64 << 20
 )
 
 // ReadIconStream parses an SVG from stream.
 func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
+	data, err := io.ReadAll(io.LimitReader(stream, maxSVGBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("svg: read input: %w", err)
+	}
+	if len(data) > maxSVGBytes {
+		return nil, fmt.Errorf("svg: input exceeds %d bytes", maxSVGBytes)
+	}
 	mode := IgnoreErrorMode
 	if len(modes) > 0 {
 		mode = modes[0]
@@ -119,11 +133,12 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 		return nil, fmt.Errorf("svg: invalid error mode %d", mode)
 	}
 	icon := &SvgIcon{
-		ids:       make(map[string]*node),
-		target:    Identity,
-		errorMode: mode,
+		ids:        make(map[string]*node),
+		warningSet: make(map[string]struct{}),
+		target:     identityMatrix(),
+		errorMode:  mode,
 	}
-	decoder := xml.NewDecoder(stream)
+	decoder := xml.NewDecoder(bytes.NewReader(data))
 	decoder.Strict = true
 	var stack []*node
 	elements := 0
@@ -150,17 +165,20 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 				return nil, fmt.Errorf("svg: document nesting exceeds %d elements", maxSVGDepth)
 			}
 			tag := strings.ToLower(value.Name.Local)
-			if !supportedElements[tag] {
+			supported := supportedElements[tag] && (value.Name.Space == "" || value.Name.Space == svgNamespace)
+			if !supported {
 				message := fmt.Sprintf("unsupported SVG element <%s>", value.Name.Local)
+				if value.Name.Space != "" && value.Name.Space != svgNamespace {
+					message = fmt.Sprintf("unsupported foreign element <%s> in namespace %q", value.Name.Local, value.Name.Space)
+				}
 				if mode == StrictErrorMode {
 					return nil, fmt.Errorf("svg: %s", message)
 				}
 				if mode == WarnErrorMode {
-					icon.warnings = append(icon.warnings, message)
-					log.Printf("coolsvg: %s", message)
+					icon.addWarning(message, true)
 				}
 			}
-			n := &node{tag: tag, attrs: make(map[string]string), transform: Identity}
+			n := &node{tag: tag, attrs: make(map[string]string), transform: identityMatrix(), unsupported: !supported}
 			for _, attr := range value.Attr {
 				n.attrs[strings.ToLower(attr.Name.Local)] = strings.TrimSpace(attr.Value)
 			}
@@ -220,11 +238,11 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 						return nil, parseErr
 					}
 					message := parseErr.Error()
-					icon.warnings = append(icon.warnings, message)
-					if mode == WarnErrorMode {
-						log.Printf("coolsvg: %s", message)
-					}
+					icon.addWarning(message, mode == WarnErrorMode)
 				} else {
+					for i := range rules {
+						rules[i].order = len(icon.css) + i
+					}
 					icon.css = append(icon.css, rules...)
 				}
 			}
@@ -233,7 +251,7 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 	if len(stack) != 0 {
 		return nil, fmt.Errorf("svg: unclosed element <%s>", stack[len(stack)-1].tag)
 	}
-	if icon.root == nil || icon.root.tag != "svg" {
+	if icon.root == nil || icon.root.tag != "svg" || icon.root.unsupported {
 		return nil, fmt.Errorf("svg: root element must be <svg>")
 	}
 	viewBox, err := readViewBox(icon.root)
@@ -241,8 +259,24 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 		return nil, err
 	}
 	icon.ViewBox = viewBox
-	icon.target = Identity
+	icon.target = identityMatrix()
 	return icon, nil
+}
+
+const maxWarnings = 100
+
+func (s *SvgIcon) addWarning(message string, shouldLog bool) {
+	if _, exists := s.warningSet[message]; exists {
+		return
+	}
+	if len(s.warnings) >= maxWarnings {
+		return
+	}
+	s.warningSet[message] = struct{}{}
+	s.warnings = append(s.warnings, message)
+	if shouldLog {
+		log.Printf("coolsvg: %s", message)
+	}
 }
 
 // ReadIcon parses an SVG file.
@@ -258,17 +292,21 @@ func ReadIcon(filename string, modes ...ErrorMode) (*SvgIcon, error) {
 // ReadReplacingCurrentColor parses an SVG after resolving currentColor to the
 // supplied CSS color. It is provided for easy migration from oksvg.
 func ReadReplacingCurrentColor(stream io.Reader, currentColor string, modes ...ErrorMode) (*SvgIcon, error) {
-	data, err := io.ReadAll(stream)
-	if err != nil {
-		return nil, fmt.Errorf("svg: read currentColor input: %w", err)
-	}
+	var replacement *color.NRGBA
 	if currentColor != "" {
-		if _, err := ParseSVGColor(currentColor); err != nil {
-			return nil, fmt.Errorf("svg: invalid currentColor: %w", err)
+		parsed, err := ParseSVGColor(currentColor)
+		if err != nil || parsed == nil {
+			return nil, fmt.Errorf("svg: invalid currentColor %q", currentColor)
 		}
-		data = bytes.ReplaceAll(data, []byte("currentColor"), []byte(currentColor))
+		value := color.NRGBAModel.Convert(parsed).(color.NRGBA)
+		replacement = &value
 	}
-	return ReadIconStream(bytes.NewReader(data), modes...)
+	icon, err := ReadIconStream(stream, modes...)
+	if err != nil {
+		return nil, err
+	}
+	icon.currentColor = replacement
+	return icon, nil
 }
 
 func readViewBox(root *node) (ViewBox, error) {
@@ -479,7 +517,6 @@ func (n *node) geometry(viewport ViewBox) (*Path, error) {
 	default:
 		return nil, nil
 	}
-	n.path = p
 	return p, nil
 }
 
@@ -517,10 +554,16 @@ func appendEllipse(p *Path, cx, cy, rx, ry float64) {
 
 // ParseSVGColorNum parses #rgb and #rrggbb colors. The leading # is optional.
 func ParseSVGColorNum(value string) (r, g, b uint8, err error) {
-	c, err := ParseSVGColor(value)
-	if err != nil {
-		return 0, 0, 0, err
+	hex := strings.TrimPrefix(strings.TrimSpace(value), "#")
+	if len(hex) == 3 {
+		hex = string([]byte{hex[0], hex[0], hex[1], hex[1], hex[2], hex[2]})
 	}
-	r16, g16, b16, _ := c.RGBA()
-	return uint8(r16 >> 8), uint8(g16 >> 8), uint8(b16 >> 8), nil
+	if len(hex) != 6 {
+		return 0, 0, 0, fmt.Errorf("svg: hexadecimal color must contain 3 or 6 digits")
+	}
+	parsed, parseErr := strconv.ParseUint(hex, 16, 32)
+	if parseErr != nil {
+		return 0, 0, 0, fmt.Errorf("svg: invalid hexadecimal color %q", value)
+	}
+	return uint8(parsed >> 16), uint8(parsed >> 8), uint8(parsed), nil
 }
