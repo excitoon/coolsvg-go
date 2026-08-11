@@ -4,7 +4,7 @@ import (
 	"image"
 	"math"
 	"math/bits"
-	"sort"
+	"slices"
 )
 
 const antialiasSamples = 4
@@ -42,9 +42,7 @@ func unionSamples(dst, src *sampleMask) {
 	if dst == nil || src == nil || dst.bounds != src.bounds {
 		return
 	}
-	for i := range dst.samples {
-		dst.samples[i] |= src.samples[i]
-	}
+	maskOr(dst.samples, src.samples)
 }
 
 func intersectSamples(dst, src *sampleMask) {
@@ -55,9 +53,7 @@ func intersectSamples(dst, src *sampleMask) {
 		clear(dst.samples)
 		return
 	}
-	for i := range dst.samples {
-		dst.samples[i] &= src.samples[i]
-	}
+	maskAnd(dst.samples, src.samples)
 }
 
 func rasterizeClipContours(bounds image.Rectangle, contours []contour, rule fillRule) *sampleMask {
@@ -96,7 +92,7 @@ func rasterizeClipContours(bounds image.Rectangle, contours []contour, rule fill
 				x := edge.a.X + (y-edge.a.Y)*(edge.b.X-edge.a.X)/(edge.b.Y-edge.a.Y)
 				crossings = append(crossings, crossing{x: x, winding: winding})
 			}
-			sort.Slice(crossings, func(i, j int) bool { return crossings[i].x < crossings[j].x })
+			slices.SortFunc(crossings, compareCrossings)
 			addInterval := func(left, right float64) { addSampleInterval(mask, py, sy, left, right) }
 			if rule == evenOdd {
 				inside, start := false, 0.0
@@ -201,7 +197,7 @@ func rasterizeContours(bounds image.Rectangle, contours []contour, rule fillRule
 				x := e.a.X + (y-e.a.Y)*(e.b.X-e.a.X)/(e.b.Y-e.a.Y)
 				crossings = append(crossings, crossing{x: x, winding: winding})
 			}
-			sort.Slice(crossings, func(i, j int) bool { return crossings[i].x < crossings[j].x })
+			slices.SortFunc(crossings, compareCrossings)
 			if rule == evenOdd {
 				inside := false
 				start := 0.0
@@ -248,6 +244,16 @@ func rasterizeContours(bounds image.Rectangle, contours []contour, rule fillRule
 		}
 	}
 	return mask
+}
+
+func compareCrossings(a, b crossing) int {
+	if a.x < b.x {
+		return -1
+	}
+	if a.x > b.x {
+		return 1
+	}
+	return 0
 }
 
 func addCoverage(row []float64, origin int, left, right float64) {
