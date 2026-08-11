@@ -1,6 +1,7 @@
 package coolsvg
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"strings"
@@ -52,6 +53,19 @@ func TestParserRejectsDoctype(t *testing.T) {
 	}
 }
 
+func TestReadIconStreamDecodesLegacyXMLCharset(t *testing.T) {
+	t.Parallel()
+
+	source := []byte("<?xml version=\"1.0\" encoding=\"iso-8859-1\"?><svg viewBox=\"0 0 1 1\"><title>caf\xe9</title></svg>")
+	icon, err := ReadIconStream(bytes.NewReader(source), StrictErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(icon.Titles) != 1 || icon.Titles[0] != "café" {
+		t.Fatalf("titles = %#v", icon.Titles)
+	}
+}
+
 func TestForeignNamespaceCannotSmuggleSVGGeometry(t *testing.T) {
 	t.Parallel()
 
@@ -71,6 +85,152 @@ func TestForeignNamespaceCannotSmuggleSVGGeometry(t *testing.T) {
 	}
 	if _, err := ReadIconStream(strings.NewReader(source), StrictErrorMode); err == nil {
 		t.Fatal("strict mode accepted a foreign element")
+	}
+}
+
+func TestForeignAttributeCannotSmuggleSVGGeometry(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg xmlns:x="urn:foreign" viewBox="0 0 4 4"><path x:d="M0 0H4V4H0Z" fill="red"/></svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	for i := 3; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0 {
+			t.Fatal("foreign path data was rendered as SVG geometry")
+		}
+	}
+}
+
+func TestUnqualifiedHrefWinsOverLegacyXLink(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 2 1">
+<defs><rect id="red" width="1" height="1" fill="red"/><rect id="blue" width="1" height="1" fill="blue"/></defs>
+<use href="#blue" xlink:href="#red"/>
+<use x="1" xlink:href="#red"/>
+</svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	if got := img.NRGBAAt(0, 0); got != (color.NRGBA{B: 255, A: 255}) {
+		t.Fatalf("href precedence rendered %#v, want blue", got)
+	}
+	if got := img.NRGBAAt(1, 0); got != (color.NRGBA{R: 255, A: 255}) {
+		t.Fatalf("legacy xlink:href rendered %#v, want red", got)
+	}
+}
+
+func TestUnsupportedSubtreeIsNotParsedOrReferenceable(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg viewBox="0 0 4 4"><foreignObject><path id="hidden" d="not valid path data"/></foreignObject><use href="#hidden"/></svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), IgnoreErrorMode)
+	if err != nil {
+		t.Fatalf("ignored subtree was parsed: %v", err)
+	}
+	if icon.ids["hidden"] != nil {
+		t.Fatal("an ID inside an unsupported subtree was registered")
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	for i := 3; i < len(img.Pix); i += 4 {
+		if img.Pix[i] != 0 {
+			t.Fatal("unsupported subtree was rendered through use")
+		}
+	}
+}
+
+func TestUnsupportedStylesAndMetadataAreIsolated(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg xmlns:x="urn:foreign" viewBox="0 0 2 1">
+<x:style>rect { fill: red }</x:style>
+<foreignObject><style>rect { fill: green }</style><title>foreign</title></foreignObject>
+<rect width="2" height="1" fill="blue"/>
+</svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), IgnoreErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(icon.Titles) != 0 {
+		t.Fatalf("foreign titles = %#v", icon.Titles)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	if got := img.NRGBAAt(0, 0); got != (color.NRGBA{B: 255, A: 255}) {
+		t.Fatalf("foreign style affected fill: %#v", got)
+	}
+}
+
+func TestMalformedElementIsSkippedOnlyInCompatibilityModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		source     string
+		wantDetail string
+	}{
+		{
+			name:       "path data",
+			source:     `<path d="hoop" fill="blue"/>`,
+			wantDetail: "svg path",
+		},
+		{
+			name:       "container transform and subtree",
+			source:     `<g transform="rotate(nope)"><rect width="2" height="2" fill="blue"/></g>`,
+			wantDetail: "transform",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			source := `<svg viewBox="0 0 4 2">` + test.source + `<rect x="2" width="2" height="2" fill="red"/></svg>`
+			for _, mode := range []ErrorMode{IgnoreErrorMode, WarnErrorMode} {
+				icon, err := ReadIconStream(strings.NewReader(source), mode)
+				if err != nil {
+					t.Fatalf("mode %d: %v", mode, err)
+				}
+				warnings := strings.Join(icon.Warnings(), "\n")
+				if mode == IgnoreErrorMode && warnings != "" {
+					t.Fatalf("ignore mode warnings = %q", warnings)
+				}
+				if mode == WarnErrorMode && !strings.Contains(warnings, test.wantDetail) {
+					t.Fatalf("warn mode warnings = %q", warnings)
+				}
+
+				img := image.NewNRGBA(image.Rect(0, 0, 4, 2))
+				if err := icon.Render(img); err != nil {
+					t.Fatal(err)
+				}
+				if alpha := img.NRGBAAt(0, 0).A; alpha != 0 {
+					t.Fatalf("skipped element alpha = %d", alpha)
+				}
+				if got := img.NRGBAAt(3, 0); got != (color.NRGBA{R: 255, A: 255}) {
+					t.Fatalf("valid sibling = %#v", got)
+				}
+			}
+
+			_, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+			if err == nil || !strings.Contains(err.Error(), test.wantDetail) {
+				t.Fatalf("strict mode error = %v", err)
+			}
+		})
 	}
 }
 
@@ -118,7 +278,7 @@ func TestParseSVGColorForms(t *testing.T) {
 func TestReadReplacingCurrentColor(t *testing.T) {
 	t.Parallel()
 
-	icon, err := ReadReplacingCurrentColor(strings.NewReader(`<svg viewBox="0 0 1 1"><rect width="1" height="1" fill="currentColor"/></svg>`), "#123456")
+	icon, err := ReadReplacingCurrentColor(strings.NewReader(`<svg viewBox="0 0 1 1"><g color="currentColor"><rect width="1" height="1" fill="currentColor"/></g></svg>`), "#123456")
 	if err != nil {
 		t.Fatal(err)
 	}

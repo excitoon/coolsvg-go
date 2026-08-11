@@ -1,8 +1,10 @@
 package coolsvg
 
 import (
+	"image"
 	"image/color"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -102,5 +104,82 @@ func TestInvalidCSSClipPathDoesNotEraseValidDeclaration(t *testing.T) {
 	}
 	if !style.hasClip || style.clipRef != "valid" {
 		t.Fatalf("clip = %q (set=%v), want valid", style.clipRef, style.hasClip)
+	}
+}
+
+func TestRasterxStrokeExtensionsAreLenientOnlyInCompatibilityModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		property string
+		value    string
+	}{
+		{property: "stroke-linecap", value: "flat"},
+		{property: "stroke-linecap", value: "cubic"},
+		{property: "stroke-linecap", value: "quadratic"},
+		{property: "stroke-linejoin", value: "arc"},
+		{property: "stroke-linejoin", value: "arc-clip"},
+		{property: "stroke-linejoin", value: "arc-limit"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.property+"_"+test.value, func(t *testing.T) {
+			t.Parallel()
+			source := `<svg viewBox="0 0 8 8"><path d="M1 7L4 1L7 7" fill="none" stroke="black" ` +
+				test.property + `="` + test.value + `"/></svg>`
+
+			for _, mode := range []ErrorMode{IgnoreErrorMode, WarnErrorMode} {
+				icon, err := ReadIconStream(strings.NewReader(source), mode)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := icon.Render(image.NewNRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+					t.Fatalf("mode %d: %v", mode, err)
+				}
+				warnings := strings.Join(icon.Warnings(), "\n")
+				if mode == IgnoreErrorMode && warnings != "" {
+					t.Fatalf("ignore mode warnings = %q", warnings)
+				}
+				if mode == WarnErrorMode && !strings.Contains(warnings, test.property) {
+					t.Fatalf("warn mode warnings = %q", warnings)
+				}
+			}
+
+			icon, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := icon.Render(image.NewNRGBA(image.Rect(0, 0, 8, 8))); err == nil || !strings.Contains(err.Error(), test.property) {
+				t.Fatalf("strict mode error = %v", err)
+			}
+		})
+	}
+}
+
+func TestWarnModeDeduplicatesConcurrentRenderWarnings(t *testing.T) {
+	t.Parallel()
+
+	icon, err := ReadIconStream(strings.NewReader(`<svg viewBox="0 0 8 8"><path d="M1 7L4 1L7 7" fill="none" stroke="black" stroke-linejoin="arc-clip"/></svg>`), WarnErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	errors := make(chan error, 16)
+	for range 16 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errors <- icon.Render(image.NewNRGBA(image.Rect(0, 0, 8, 8)))
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if warnings := icon.Warnings(); len(warnings) != 1 {
+		t.Fatalf("warnings = %#v, want one deduplicated warning", warnings)
 	}
 }

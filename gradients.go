@@ -5,7 +5,7 @@ import (
 	"image"
 	"image/color"
 	"math"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -27,27 +27,47 @@ type gradientImage struct {
 	definition gradientDefinition
 	inverse    Matrix
 	opacity    float64
+	bounds     image.Rectangle
 }
 
 func (g *gradientImage) ColorModel() color.Model { return color.NRGBAModel }
-func (g *gradientImage) Bounds() image.Rectangle { return image.Rect(-1<<30, -1<<30, 1<<30, 1<<30) }
+func (g *gradientImage) Bounds() image.Rectangle { return g.bounds }
 
 func (g *gradientImage) At(x, y int) color.Color {
-	p := g.inverse.Apply(Point{X: float64(x) + 0.5, Y: float64(y) + 0.5})
+	return g.colorAt(x, y)
+}
+
+// RGBA64At lets image/draw avoid allocating a color interface value for every
+// gradient pixel.
+func (g *gradientImage) RGBA64At(x, y int) color.RGBA64 {
+	return nrgbaToRGBA64(g.colorAt(x, y))
+}
+
+func (g *gradientImage) colorAt(x, y int) color.NRGBA {
+	value := gradientValueAt(g.definition, g.inverse, x, y)
+	result := interpolateStops(g.definition.stops, value)
+	result.A = uint8(math.Round(float64(result.A) * g.opacity))
+	return result
+}
+
+// gradientValueAt evaluates the shared geometry and spread rules used by both
+// the sRGB and CMYK-native gradient samplers.
+func gradientValueAt(definition gradientDefinition, inverse Matrix, x, y int) float64 {
+	p := inverse.Apply(Point{X: float64(x) + 0.5, Y: float64(y) + 0.5})
 	value := 0.0
-	if g.definition.kind == "lineargradient" {
-		x1, y1 := g.definition.number("x1"), g.definition.number("y1")
-		x2, y2 := g.definition.number("x2"), g.definition.number("y2")
+	if definition.kind == "lineargradient" {
+		x1, y1 := definition.number("x1"), definition.number("y1")
+		x2, y2 := definition.number("x2"), definition.number("y2")
 		dx, dy := x2-x1, y2-y1
 		denominator := dx*dx + dy*dy
 		if denominator > 0 {
 			value = ((p.X-x1)*dx + (p.Y-y1)*dy) / denominator
 		}
 	} else {
-		cx, cy := g.definition.number("cx"), g.definition.number("cy")
-		fx, fy := g.definition.number("fx"), g.definition.number("fy")
-		radius := g.definition.number("r")
-		fr := g.definition.number("fr")
+		cx, cy := definition.number("cx"), definition.number("cy")
+		fx, fy := definition.number("fx"), definition.number("fy")
+		radius := definition.number("r")
+		fr := definition.number("fr")
 		dx, dy := p.X-fx, p.Y-fy
 		a := dx*dx + dy*dy
 		b := 2 * (dx*(fx-cx) + dy*(fy-cy))
@@ -65,10 +85,7 @@ func (g *gradientImage) At(x, y int) color.Color {
 			}
 		}
 	}
-	value = spreadGradient(value, g.definition.spread)
-	result := interpolateStops(g.definition.stops, value)
-	result.A = uint8(math.Round(float64(result.A) * g.opacity))
-	return result
+	return spreadGradient(value, definition.spread)
 }
 
 func (g gradientDefinition) number(name string) float64 {
@@ -85,6 +102,7 @@ func (r *renderer) gradientSource(ref string, opacity float64, ctm Matrix, bound
 	if err != nil {
 		return nil, err
 	}
+	definition = normalizeGradientDefinition(definition, r.icon.ViewBox)
 	if len(definition.stops) == 0 {
 		return nil, nil
 	}
@@ -100,12 +118,20 @@ func (r *renderer) gradientSource(ref string, opacity float64, ctm Matrix, bound
 	if !ok {
 		return nil, nil
 	}
-	return &gradientImage{definition: definition, inverse: inverse, opacity: math.Max(0, math.Min(1, opacity))}, nil
+	return &gradientImage{
+		definition: definition,
+		inverse:    inverse,
+		opacity:    math.Max(0, math.Min(1, opacity)),
+		bounds:     r.bounds,
+	}, nil
 }
 
 func (r *renderer) resolveGradient(n *node, visiting map[*node]bool) (gradientDefinition, error) {
 	if visiting[n] {
 		return gradientDefinition{}, fmt.Errorf("svg: cyclic gradient reference %q", n.attr("id"))
+	}
+	if len(visiting) >= maxReferenceDepth {
+		return gradientDefinition{}, fmt.Errorf("svg: gradient reference depth exceeds %d", maxReferenceDepth)
 	}
 	visiting[n] = true
 	defer delete(visiting, n)
@@ -124,31 +150,11 @@ func (r *renderer) resolveGradient(n *node, visiting map[*node]bool) (gradientDe
 	}
 	for _, name := range []string{"x1", "y1", "x2", "y2", "cx", "cy", "r", "fx", "fy", "fr"} {
 		if value := n.attr(name); value != "" {
-			definition.values[name] = normalizeGradientLength(value, definition.units, name, r.icon.ViewBox)
+			definition.values[name] = strings.TrimSpace(value)
 		}
 	}
 	if units := strings.ToLower(n.attr("gradientunits")); units == "userspaceonuse" || units == "objectboundingbox" {
 		definition.units = units
-		if units == "userspaceonuse" {
-			if _, inherited := referenceID(n.href()); !inherited {
-				if n.tag == "lineargradient" {
-					definition.values["x1"], definition.values["y1"] = "0", "0"
-					definition.values["x2"], definition.values["y2"] = fmt.Sprintf("%.17g", r.icon.ViewBox.W), "0"
-				} else {
-					definition.values["cx"] = fmt.Sprintf("%.17g", r.icon.ViewBox.W/2)
-					definition.values["cy"] = fmt.Sprintf("%.17g", r.icon.ViewBox.H/2)
-					definition.values["r"] = fmt.Sprintf("%.17g", math.Hypot(r.icon.ViewBox.W, r.icon.ViewBox.H)/(2*math.Sqrt2))
-					definition.values["fx"], definition.values["fy"] = definition.values["cx"], definition.values["cy"]
-					definition.values["fr"] = "0"
-				}
-			}
-		}
-		// Re-normalize this node's coordinates after reading its units.
-		for _, name := range []string{"x1", "y1", "x2", "y2", "cx", "cy", "r", "fx", "fy", "fr"} {
-			if value := n.attr(name); value != "" {
-				definition.values[name] = normalizeGradientLength(value, definition.units, name, r.icon.ViewBox)
-			}
-		}
 	}
 	if spread := strings.ToLower(n.attr("spreadmethod")); spread == "pad" || spread == "repeat" || spread == "reflect" {
 		definition.spread = spread
@@ -165,14 +171,6 @@ func (r *renderer) resolveGradient(n *node, visiting map[*node]bool) (gradientDe
 	} else if len(stops) > 0 {
 		definition.stops = stops
 	}
-	if definition.kind == "radialgradient" {
-		if n.attr("fx") == "" && definition.values["fx"] == "" {
-			definition.values["fx"] = definition.values["cx"]
-		}
-		if n.attr("fy") == "" && definition.values["fy"] == "" {
-			definition.values["fy"] = definition.values["cy"]
-		}
-	}
 	return definition, nil
 }
 
@@ -185,17 +183,32 @@ func defaultGradient(kind string) gradientDefinition {
 		values:    make(map[string]string),
 	}
 	if kind == "lineargradient" {
-		definition.values["x1"] = "0"
-		definition.values["y1"] = "0"
-		definition.values["x2"] = "1"
-		definition.values["y2"] = "0"
+		definition.values["x1"] = "0%"
+		definition.values["y1"] = "0%"
+		definition.values["x2"] = "100%"
+		definition.values["y2"] = "0%"
 	} else {
-		definition.values["cx"] = "0.5"
-		definition.values["cy"] = "0.5"
-		definition.values["r"] = "0.5"
-		definition.values["fx"] = "0.5"
-		definition.values["fy"] = "0.5"
-		definition.values["fr"] = "0"
+		definition.values["cx"] = "50%"
+		definition.values["cy"] = "50%"
+		definition.values["r"] = "50%"
+		definition.values["fr"] = "0%"
+	}
+	return definition
+}
+
+func normalizeGradientDefinition(definition gradientDefinition, viewport ViewBox) gradientDefinition {
+	if definition.kind == "radialgradient" {
+		if definition.values["fx"] == "" {
+			definition.values["fx"] = definition.values["cx"]
+		}
+		if definition.values["fy"] == "" {
+			definition.values["fy"] = definition.values["cy"]
+		}
+	}
+	for _, name := range []string{"x1", "y1", "x2", "y2", "cx", "cy", "r", "fx", "fy", "fr"} {
+		if value := definition.values[name]; value != "" {
+			definition.values[name] = normalizeGradientLength(value, definition.units, name, viewport)
+		}
 	}
 	return definition
 }
@@ -230,21 +243,6 @@ func (r *renderer) readGradientStops(n *node) ([]gradientStop, error) {
 		if child.tag != "stop" {
 			continue
 		}
-		properties := make(declarations)
-		if raw := child.attr("style"); raw != "" {
-			parsed, err := parseDeclarations(raw)
-			if err != nil {
-				return nil, err
-			}
-			for key, value := range parsed {
-				properties[key] = value
-			}
-		}
-		for _, name := range []string{"stop-color", "stop-opacity"} {
-			if value := child.attr(name); value != "" {
-				properties[name] = declaration{value: value}
-			}
-		}
 		offset := 0.0
 		if rawOffset := child.attr("offset"); rawOffset != "" {
 			var err error
@@ -257,26 +255,36 @@ func (r *renderer) readGradientStops(n *node) ([]gradientStop, error) {
 			offset = lastOffset
 		}
 		lastOffset = offset
-		stopColor := color.NRGBA{A: 255}
-		if property := properties["stop-color"]; property.value != "" && !strings.EqualFold(property.value, "currentcolor") {
-			value := property.value
-			parsed, err := ParseSVGColor(value)
-			if err != nil || parsed == nil {
-				return nil, fmt.Errorf("svg: invalid gradient stop color %q", value)
-			}
-			stopColor = color.NRGBAModel.Convert(parsed).(color.NRGBA)
+		parentStyle, err := r.definitionParentStyle(child)
+		if err != nil {
+			return nil, err
 		}
-		if property := properties["stop-opacity"]; property.value != "" {
-			value := property.value
-			opacity, err := parseFraction(value)
-			if err != nil {
-				return nil, err
-			}
-			stopColor.A = uint8(math.Round(float64(stopColor.A) * opacity))
+		style, err := r.icon.computeStyle(child, parentStyle)
+		if err != nil {
+			return nil, err
 		}
+		stopColor := color.NRGBA{}
+		switch style.stopColor.kind {
+		case paintColor:
+			stopColor = style.stopColor.color
+		case paintCurrentColor:
+			stopColor = style.color
+			if r.icon.currentColor != nil {
+				stopColor = *r.icon.currentColor
+			}
+		}
+		stopColor.A = uint8(math.Round(float64(stopColor.A) * style.stopOpacity))
 		stops = append(stops, gradientStop{offset: offset, color: stopColor})
 	}
-	sort.SliceStable(stops, func(i, j int) bool { return stops[i].offset < stops[j].offset })
+	slices.SortStableFunc(stops, func(a, b gradientStop) int {
+		if a.offset < b.offset {
+			return -1
+		}
+		if a.offset > b.offset {
+			return 1
+		}
+		return 0
+	})
 	return stops, nil
 }
 

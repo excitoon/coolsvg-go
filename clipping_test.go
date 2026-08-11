@@ -133,3 +133,23 @@ func TestSiblingClipUnionPreservesComplementarySubpixels(t *testing.T) {
 		t.Fatalf("union alpha = %d, want approximately 50%%", alpha)
 	}
 }
+
+func TestObjectBoundingBoxExcludesDisplayNoneGeometry(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg viewBox="0 0 100 20">
+<defs><clipPath id="c" clipPathUnits="objectBoundingBox"><rect width=".5" height="1"/></clipPath></defs>
+<g clip-path="url(#c)"><rect width="20" height="20"/><rect x="80" width="20" height="20" display="none"/></g>
+</svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, 100, 20))
+	if err := icon.Render(img); err != nil {
+		t.Fatal(err)
+	}
+	if img.NRGBAAt(5, 10).A < 240 || img.NRGBAAt(15, 10).A > 15 {
+		t.Fatal("display:none geometry changed the object bounding box")
+	}
+}

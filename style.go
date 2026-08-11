@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -36,9 +36,11 @@ type paintSpec struct {
 type computedStyle struct {
 	fill          paintSpec
 	stroke        paintSpec
+	stopColor     paintSpec
 	color         color.NRGBA
 	fillOpacity   float64
 	strokeOpacity float64
+	stopOpacity   float64
 	opacity       float64
 	fillRule      fillRule
 	clipRule      fillRule
@@ -57,9 +59,11 @@ type computedStyle struct {
 func defaultComputedStyle() computedStyle {
 	return computedStyle{
 		fill:          paintSpec{kind: paintColor, color: color.NRGBA{A: 255}},
+		stopColor:     paintSpec{kind: paintColor, color: color.NRGBA{A: 255}},
 		color:         color.NRGBA{A: 255},
 		fillOpacity:   1,
 		strokeOpacity: 1,
+		stopOpacity:   1,
 		opacity:       1,
 		strokeWidth:   1,
 		strokeCap:     "butt",
@@ -115,16 +119,9 @@ func parseCSS(source string) ([]cssRule, error) {
 		}
 		for _, selector := range selectors {
 			selector = strings.TrimSpace(selector)
-			if selector == "" || strings.ContainsAny(selector, " >+~:[") {
+			_, _, _, specificity, ok := parseSimpleSelector(selector)
+			if !ok {
 				continue
-			}
-			specificity := 1
-			if selector[0] == '#' {
-				specificity = 100
-			} else if selector[0] == '.' {
-				specificity = 10
-			} else if selector == "*" {
-				specificity = 0
 			}
 			rules = append(rules, cssRule{selector: selector, declarations: declarations, specificity: specificity, order: order})
 			order++
@@ -160,22 +157,73 @@ func parseDeclarations(source string) (declarations, error) {
 }
 
 func (r cssRule) matches(n *node) bool {
-	if r.selector == "*" {
-		return true
-	}
-	if strings.HasPrefix(r.selector, "#") {
-		return n.attr("id") == r.selector[1:]
-	}
-	if strings.HasPrefix(r.selector, ".") {
-		wanted := r.selector[1:]
-		for _, class := range strings.Fields(n.attr("class")) {
-			if class == wanted {
-				return true
-			}
-		}
+	tag, id, classes, _, ok := parseSimpleSelector(r.selector)
+	if !ok || tag != "" && tag != "*" && !strings.EqualFold(n.tag, tag) || id != "" && n.attr("id") != id {
 		return false
 	}
-	return strings.EqualFold(n.tag, r.selector)
+	nodeClasses := strings.Fields(n.attr("class"))
+	for _, wanted := range classes {
+		found := false
+		for _, class := range nodeClasses {
+			if class == wanted {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func parseSimpleSelector(selector string) (tag, id string, classes []string, specificity int, ok bool) {
+	if selector == "" || strings.ContainsAny(selector, " \t\r\n>+~:[") {
+		return "", "", nil, 0, false
+	}
+	readName := func(start int) (string, int) {
+		end := start
+		for end < len(selector) {
+			c := selector[end]
+			if c != '-' && c != '_' && (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+				break
+			}
+			end++
+		}
+		return selector[start:end], end
+	}
+	i := 0
+	if selector[0] == '*' {
+		tag, i = "*", 1
+	} else if selector[0] != '.' && selector[0] != '#' {
+		tag, i = readName(0)
+		if tag == "" {
+			return "", "", nil, 0, false
+		}
+		specificity++
+	}
+	for i < len(selector) {
+		marker := selector[i]
+		if marker != '.' && marker != '#' {
+			return "", "", nil, 0, false
+		}
+		name, next := readName(i + 1)
+		if name == "" {
+			return "", "", nil, 0, false
+		}
+		if marker == '#' {
+			if id != "" {
+				return "", "", nil, 0, false
+			}
+			id = name
+			specificity += 100
+		} else {
+			classes = append(classes, name)
+			specificity += 10
+		}
+		i = next
+	}
+	return tag, id, classes, specificity, true
 }
 
 var presentationProperties = []string{
@@ -183,6 +231,7 @@ var presentationProperties = []string{
 	"stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-miterlimit",
 	"stroke-dasharray", "stroke-dashoffset", "clip-rule", "opacity", "display",
 	"visibility", "clip-path",
+	"stop-color", "stop-opacity",
 }
 
 func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, error) {
@@ -195,7 +244,7 @@ func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, er
 	style.hasClip = false
 	for _, property := range presentationProperties {
 		if value := n.attr(property); value != "" {
-			if err := applyDeclaration(&style, parent, property, value); err != nil {
+			if err := s.applyDeclaration(&style, parent, property, value); err != nil {
 				return style, err
 			}
 		}
@@ -207,14 +256,17 @@ func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, er
 			matching = append(matching, rule)
 		}
 	}
-	sort.SliceStable(matching, func(i, j int) bool {
-		if matching[i].specificity == matching[j].specificity {
-			return matching[i].order < matching[j].order
+	slices.SortStableFunc(matching, func(a, b cssRule) int {
+		if a.specificity < b.specificity || a.specificity == b.specificity && a.order < b.order {
+			return -1
 		}
-		return matching[i].specificity < matching[j].specificity
+		if a.specificity > b.specificity || a.order > b.order {
+			return 1
+		}
+		return 0
 	})
 	for _, rule := range matching {
-		if err := applyDeclarations(&style, parent, rule.declarations, false); err != nil {
+		if err := s.applyDeclarations(&style, parent, rule.declarations, false); err != nil {
 			return style, err
 		}
 	}
@@ -225,29 +277,48 @@ func (s *SvgIcon) computeStyle(n *node, parent computedStyle) (computedStyle, er
 			return style, err
 		}
 		inline = declarations
-		if err := applyDeclarations(&style, parent, declarations, false); err != nil {
+		if err := s.applyDeclarations(&style, parent, declarations, false); err != nil {
 			return style, err
 		}
 	}
 	for _, rule := range matching {
-		if err := applyDeclarations(&style, parent, rule.declarations, true); err != nil {
+		if err := s.applyDeclarations(&style, parent, rule.declarations, true); err != nil {
 			return style, err
 		}
 	}
-	if err := applyDeclarations(&style, parent, inline, true); err != nil {
+	if err := s.applyDeclarations(&style, parent, inline, true); err != nil {
 		return style, err
 	}
 	return style, nil
 }
 
-func applyDeclarations(style *computedStyle, parent computedStyle, declarations declarations, important bool) error {
+func (s *SvgIcon) applyDeclarations(style *computedStyle, parent computedStyle, declarations declarations, important bool) error {
 	for name, declaration := range declarations {
 		if declaration.important != important {
 			continue
 		}
-		if err := applyDeclaration(style, parent, name, declaration.value); err != nil {
+		if err := s.applyDeclaration(style, parent, name, declaration.value); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (s *SvgIcon) applyDeclaration(style *computedStyle, parent computedStyle, name, value string) error {
+	err := applyDeclaration(style, parent, name, value)
+	if err == nil || s.errorMode == StrictErrorMode {
+		return err
+	}
+
+	// rasterx, and therefore oksvg, accepts several non-standard cap and join
+	// extensions. Compatibility mode leaves those invalid declarations at the
+	// inherited value instead of making an otherwise renderable icon fail.
+	property := strings.ToLower(strings.TrimSpace(name))
+	if property != "stroke-linecap" && property != "stroke-linejoin" {
+		return err
+	}
+	if s.errorMode == WarnErrorMode {
+		s.addWarning(err.Error(), true)
 	}
 	return nil
 }
@@ -260,12 +331,16 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 			style.fill = parent.fill
 		case "stroke":
 			style.stroke = parent.stroke
+		case "stop-color":
+			style.stopColor = parent.stopColor
 		case "color":
 			style.color = parent.color
 		case "fill-opacity":
 			style.fillOpacity = parent.fillOpacity
 		case "stroke-opacity":
 			style.strokeOpacity = parent.strokeOpacity
+		case "stop-opacity":
+			style.stopOpacity = parent.stopOpacity
 		case "opacity":
 			style.opacity = parent.opacity
 		case "fill-rule":
@@ -282,23 +357,29 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 		return nil
 	}
 	switch name {
-	case "fill", "stroke":
+	case "fill", "stroke", "stop-color":
 		paint, err := parsePaint(value)
 		if err != nil {
 			return fmt.Errorf("svg: %s: %w", name, err)
 		}
 		if name == "fill" {
 			style.fill = paint
-		} else {
+		} else if name == "stroke" {
 			style.stroke = paint
+		} else {
+			style.stopColor = paint
 		}
 	case "color":
+		if strings.EqualFold(value, "currentcolor") {
+			style.color = parent.color
+			break
+		}
 		parsed, err := ParseSVGColor(value)
 		if err != nil || parsed == nil {
 			return fmt.Errorf("svg: color: invalid color %q", value)
 		}
 		style.color = color.NRGBAModel.Convert(parsed).(color.NRGBA)
-	case "fill-opacity", "stroke-opacity", "opacity":
+	case "fill-opacity", "stroke-opacity", "stop-opacity", "opacity":
 		opacity, err := parseFraction(value)
 		if err != nil {
 			return fmt.Errorf("svg: %s: %w", name, err)
@@ -308,6 +389,8 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 			style.fillOpacity = opacity
 		case "stroke-opacity":
 			style.strokeOpacity = opacity
+		case "stop-opacity":
+			style.stopOpacity = opacity
 		case "opacity":
 			style.opacity = opacity
 		}

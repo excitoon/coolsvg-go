@@ -12,6 +12,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+
+	"golang.org/x/net/html/charset"
 )
 
 // ErrorMode controls how the parser handles unsupported SVG elements.
@@ -44,14 +47,17 @@ type SvgIcon struct {
 	ids          map[string]*node
 	css          []cssRule
 	target       Matrix
+	warningMu    sync.Mutex
 	warnings     []string
 	warningSet   map[string]struct{}
 	errorMode    ErrorMode
 	currentColor *color.NRGBA
 }
 
-// Warnings returns a copy of non-fatal parse warnings.
+// Warnings returns a copy of non-fatal compatibility warnings.
 func (s *SvgIcon) Warnings() []string {
+	s.warningMu.Lock()
+	defer s.warningMu.Unlock()
 	return append([]string(nil), s.warnings...)
 }
 
@@ -94,6 +100,7 @@ var supportedElements = map[string]bool{
 }
 
 const svgNamespace = "http://www.w3.org/2000/svg"
+const xlinkNamespace = "http://www.w3.org/1999/xlink"
 
 const (
 	maxSVGDepth    = 512
@@ -125,6 +132,7 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 	}
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	decoder.Strict = true
+	decoder.CharsetReader = charset.NewReaderLabel
 	var stack []*node
 	elements := 0
 
@@ -150,8 +158,10 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 				return nil, fmt.Errorf("svg: document nesting exceeds %d elements", maxSVGDepth)
 			}
 			tag := strings.ToLower(value.Name.Local)
-			supported := supportedElements[tag] && (value.Name.Space == "" || value.Name.Space == svgNamespace)
-			if !supported {
+			directlySupported := supportedElements[tag] && (value.Name.Space == "" || value.Name.Space == svgNamespace)
+			unsupportedAncestor := len(stack) > 0 && stack[len(stack)-1].unsupported
+			supported := directlySupported && !unsupportedAncestor
+			if !directlySupported {
 				message := fmt.Sprintf("unsupported SVG element <%s>", value.Name.Local)
 				if value.Name.Space != "" && value.Name.Space != svgNamespace {
 					message = fmt.Sprintf("unsupported foreign element <%s> in namespace %q", value.Name.Local, value.Name.Space)
@@ -165,21 +175,35 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 			}
 			n := &node{tag: tag, attrs: make(map[string]string), transform: identityMatrix(), unsupported: !supported}
 			for _, attr := range value.Attr {
-				n.attrs[strings.ToLower(attr.Name.Local)] = strings.TrimSpace(attr.Value)
-			}
-			if raw := n.attr("transform"); raw != "" {
-				n.transform, err = parseTransform(raw)
-				if err != nil {
-					return nil, err
+				name := strings.ToLower(attr.Name.Local)
+				switch {
+				case attr.Name.Space == "" || attr.Name.Space == svgNamespace:
+					n.attrs[name] = strings.TrimSpace(attr.Value)
+				case attr.Name.Space == xlinkNamespace && name == "href":
+					if _, exists := n.attrs["href"]; !exists {
+						n.attrs["href"] = strings.TrimSpace(attr.Value)
+					}
 				}
 			}
-			if raw := n.attr("d"); tag == "path" && raw != "" {
-				n.path, err = ParsePath(raw)
-				if err != nil {
-					return nil, err
+			if raw := n.attr("transform"); raw != "" && !n.unsupported {
+				var parseErr error
+				n.transform, parseErr = parseTransform(raw)
+				if parseErr != nil {
+					if err := icon.handleElementParseError(n, parseErr); err != nil {
+						return nil, err
+					}
 				}
 			}
-			if id := n.attr("id"); id != "" {
+			if raw := n.attr("d"); tag == "path" && raw != "" && !n.unsupported {
+				var parseErr error
+				n.path, parseErr = ParsePath(raw)
+				if parseErr != nil {
+					if err := icon.handleElementParseError(n, parseErr); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if id := n.attr("id"); id != "" && !n.unsupported {
 				if _, exists := icon.ids[id]; exists {
 					return nil, fmt.Errorf("svg: duplicate id %q", id)
 				}
@@ -199,7 +223,7 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 				continue
 			}
 			n := stack[len(stack)-1]
-			if n.tag == "title" || n.tag == "desc" || n.tag == "style" {
+			if !n.unsupported && (n.tag == "title" || n.tag == "desc" || n.tag == "style") {
 				n.text.Write(value)
 			}
 		case xml.EndElement:
@@ -210,6 +234,9 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 			stack = stack[:len(stack)-1]
 			if n.tag != strings.ToLower(value.Name.Local) {
 				return nil, fmt.Errorf("svg: closing element </%s> does not match <%s>", value.Name.Local, n.tag)
+			}
+			if n.unsupported {
+				continue
 			}
 			switch n.tag {
 			case "title":
@@ -250,15 +277,34 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 
 const maxWarnings = 100
 
+func (s *SvgIcon) handleElementParseError(n *node, parseErr error) error {
+	err := fmt.Errorf("svg: <%s>: %w", n.tag, parseErr)
+	if s.errorMode == StrictErrorMode {
+		return err
+	}
+	n.unsupported = true
+	if s.errorMode == WarnErrorMode {
+		s.addWarning(err.Error(), true)
+	}
+	return nil
+}
+
 func (s *SvgIcon) addWarning(message string, shouldLog bool) {
+	s.warningMu.Lock()
 	if _, exists := s.warningSet[message]; exists {
+		s.warningMu.Unlock()
 		return
 	}
 	if len(s.warnings) >= maxWarnings {
+		s.warningMu.Unlock()
 		return
+	}
+	if s.warningSet == nil {
+		s.warningSet = make(map[string]struct{})
 	}
 	s.warningSet[message] = struct{}{}
 	s.warnings = append(s.warnings, message)
+	s.warningMu.Unlock()
 	if shouldLog {
 		log.Printf("coolsvg: %s", message)
 	}
