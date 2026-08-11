@@ -284,28 +284,6 @@ func unionMask(dst, src *image.Alpha) {
 	}
 }
 
-func intersectMask(dst, src *image.Alpha) {
-	if dst == nil {
-		return
-	}
-	if src == nil {
-		clear(dst.Pix)
-		return
-	}
-	bounds := dst.Bounds()
-	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
-		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			di := dst.PixOffset(x, y)
-			if !image.Pt(x, y).In(src.Bounds()) {
-				dst.Pix[di] = 0
-				continue
-			}
-			si := src.PixOffset(x, y)
-			dst.Pix[di] = uint8((uint16(dst.Pix[di])*uint16(src.Pix[si]) + 127) / 255)
-		}
-	}
-}
-
 func scaleMask(mask *image.Alpha, opacity float64) {
 	if mask == nil || opacity >= 1 {
 		return

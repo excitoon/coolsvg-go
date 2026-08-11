@@ -84,21 +84,6 @@ func (n *node) href() string {
 	return strings.TrimSpace(n.attr("href"))
 }
 
-func (n *node) localRef(attribute string) (string, bool) {
-	v := strings.TrimSpace(n.attr(attribute))
-	if v == "" || strings.EqualFold(v, "none") {
-		return "", false
-	}
-	if strings.HasPrefix(v, "url(") && strings.HasSuffix(v, ")") {
-		v = strings.TrimSpace(v[4 : len(v)-1])
-		v = strings.Trim(v, "\"'")
-	}
-	if strings.HasPrefix(v, "#") && len(v) > 1 {
-		return v[1:], true
-	}
-	return "", false
-}
-
 var supportedElements = map[string]bool{
 	"svg": true, "g": true, "defs": true, "symbol": true,
 	"path": true, "rect": true, "circle": true, "ellipse": true,

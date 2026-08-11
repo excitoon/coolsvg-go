@@ -211,10 +211,7 @@ func add(a, b Point) Point         { return Point{a.X + b.X, a.Y + b.Y} }
 func sub(a, b Point) Point         { return Point{a.X - b.X, a.Y - b.Y} }
 func mul(a Point, n float64) Point { return Point{a.X * n, a.Y * n} }
 func midpoint(a, b Point) Point    { return Point{(a.X + b.X) / 2, (a.Y + b.Y) / 2} }
-func distanceToLine(p, a, b Point) float64 {
-	return math.Abs((b.X-a.X)*(a.Y-p.Y)-(a.X-p.X)*(b.Y-a.Y)) / math.Max(math.Hypot(b.X-a.X, b.Y-a.Y), 1e-15)
-}
-func almostEqual(a, b Point) bool { return math.Abs(a.X-b.X) < 1e-12 && math.Abs(a.Y-b.Y) < 1e-12 }
+func almostEqual(a, b Point) bool  { return math.Abs(a.X-b.X) < 1e-12 && math.Abs(a.Y-b.Y) < 1e-12 }
 func pointOnEllipse(cx, cy, rx, ry, phi, t float64) Point {
 	return Point{cx + rx*math.Cos(phi)*math.Cos(t) - ry*math.Sin(phi)*math.Sin(t), cy + rx*math.Sin(phi)*math.Cos(t) + ry*math.Cos(phi)*math.Sin(t)}
 }
