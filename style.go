@@ -385,9 +385,9 @@ func applyDeclaration(style *computedStyle, parent computedStyle, name, value st
 	case "visibility":
 		style.visible = !strings.EqualFold(value, "hidden") && !strings.EqualFold(value, "collapse")
 	case "clip-path":
-		style.clipRef, style.hasClip = "", false
 		value = strings.TrimSpace(value)
 		if strings.EqualFold(value, "none") || value == "" {
+			style.clipRef, style.hasClip = "", false
 			break
 		}
 		if strings.HasPrefix(strings.ToLower(value), "url(") && strings.HasSuffix(value, ")") {

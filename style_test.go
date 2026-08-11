@@ -83,3 +83,24 @@ func TestCSSClipPathBeatsPresentationAttribute(t *testing.T) {
 		t.Fatalf("clip = %q (set=%v), want small", style.clipRef, style.hasClip)
 	}
 }
+
+func TestInvalidCSSClipPathDoesNotEraseValidDeclaration(t *testing.T) {
+	t.Parallel()
+
+	source := `<svg viewBox="0 0 20 20">
+<style>.subject { clip-path: not-a-url }</style>
+<defs><clipPath id="valid"><rect width="10" height="10"/></clipPath></defs>
+<rect class="subject" width="20" height="20" clip-path="url(#valid)"/>
+</svg>`
+	icon, err := ReadIconStream(strings.NewReader(source), StrictErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	style, err := icon.computeStyle(icon.root.children[2], defaultComputedStyle())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !style.hasClip || style.clipRef != "valid" {
+		t.Fatalf("clip = %q (set=%v), want valid", style.clipRef, style.hasClip)
+	}
+}
