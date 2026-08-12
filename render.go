@@ -3,7 +3,6 @@ package coolsvg
 import (
 	"fmt"
 	"image"
-	"image/color"
 	stddraw "image/draw"
 	"math"
 	"strings"
@@ -28,7 +27,7 @@ func (s *SvgIcon) Draw(dst stddraw.Image, opacity float64) error {
 	if s == nil || s.root == nil {
 		return fmt.Errorf("svg: cannot draw a nil icon")
 	}
-	if dst == nil {
+	if dst == nil || nilInterface(dst) {
 		return fmt.Errorf("svg: destination is nil")
 	}
 	if math.IsNaN(opacity) || math.IsInf(opacity, 0) {
@@ -38,14 +37,7 @@ func (s *SvgIcon) Draw(dst stddraw.Image, opacity float64) error {
 	if opacity == 0 || dst.Bounds().Empty() {
 		return nil
 	}
-	r := renderer{
-		icon:     s,
-		bounds:   dst.Bounds(),
-		useStack: make(map[*node]bool),
-		budget:   maxRenderOperations,
-	}
-	base := defaultComputedStyle()
-	return r.renderNode(dst, s.root, base, s.target, s.ViewBox, opacity)
+	return s.DrawRegionWithOptions(dst, dst.Bounds(), opacity, RenderOptions{})
 }
 
 // DrawRegion draws a region of the virtual destination into dst. region uses
@@ -56,59 +48,14 @@ func (s *SvgIcon) Draw(dst stddraw.Image, opacity float64) error {
 // DrawRegion is useful for rendering tiles of a large target without
 // allocating an image for the full target.
 func (s *SvgIcon) DrawRegion(dst stddraw.Image, region image.Rectangle, opacity float64) error {
-	if dst == nil {
+	if dst == nil || nilInterface(dst) {
 		return fmt.Errorf("svg: destination is nil")
 	}
 	destinationBounds := dst.Bounds()
 	if !rectanglesHaveSameSize(destinationBounds, region) {
 		return fmt.Errorf("svg: destination bounds %v and region %v must have the same dimensions", destinationBounds, region)
 	}
-	return s.Draw(translatedDrawImage{Image: dst, bounds: region, destinationMin: destinationBounds.Min}, opacity)
-}
-
-// translatedDrawImage exposes a local image through global coordinates. Using
-// relative coordinates in translatedPoint avoids overflowing when the two
-// rectangle minima are far apart.
-type translatedDrawImage struct {
-	stddraw.Image
-	bounds         image.Rectangle
-	destinationMin image.Point
-}
-
-func (i translatedDrawImage) Bounds() image.Rectangle { return i.bounds }
-
-func (i translatedDrawImage) At(x, y int) color.Color {
-	p := i.translatedPoint(x, y)
-	return i.Image.At(p.X, p.Y)
-}
-
-func (i translatedDrawImage) Set(x, y int, value color.Color) {
-	p := i.translatedPoint(x, y)
-	i.Image.Set(p.X, p.Y, value)
-}
-
-func (i translatedDrawImage) RGBA64At(x, y int) color.RGBA64 {
-	p := i.translatedPoint(x, y)
-	if source, ok := i.Image.(image.RGBA64Image); ok {
-		return source.RGBA64At(p.X, p.Y)
-	}
-	return color.RGBA64Model.Convert(i.Image.At(p.X, p.Y)).(color.RGBA64)
-}
-
-func (i translatedDrawImage) SetRGBA64(x, y int, value color.RGBA64) {
-	p := i.translatedPoint(x, y)
-	if destination, ok := i.Image.(stddraw.RGBA64Image); ok {
-		destination.SetRGBA64(p.X, p.Y, value)
-		return
-	}
-	i.Image.Set(p.X, p.Y, value)
-}
-
-func (i translatedDrawImage) translatedPoint(x, y int) image.Point {
-	return image.Pt(
-		i.destinationMin.X+(x-i.bounds.Min.X),
-		i.destinationMin.Y+(y-i.bounds.Min.Y),
-	)
+	return s.DrawRegionWithOptions(dst, region, opacity, RenderOptions{})
 }
 
 func rectanglesHaveSameSize(a, b image.Rectangle) bool {
@@ -123,10 +70,55 @@ func rectanglesHaveSameSize(a, b image.Rectangle) bool {
 }
 
 type renderer struct {
-	icon     *SvgIcon
-	bounds   image.Rectangle
-	useStack map[*node]bool
-	budget   int
+	icon          *SvgIcon
+	bounds        image.Rectangle
+	useStack      map[*node]bool
+	budget        int
+	flatten       flattenBudget
+	surfaces      precisionSurfaceBudget
+	partitionWork precisionPartitionWorkBudget
+	auxiliary     precisionAuxiliaryBudget
+	coveragePool  []*coverageMask
+	clipCache     map[clipMaskCacheKey]*sampleMask
+	fillMaskCache map[fillMaskCacheKey]*sampleMask
+	strokeCache   map[strokeMaskCacheKey][]strokeMaskCacheEntry
+	geometryCache map[geometryCacheKey]geometryCacheValue
+	flattenCache  map[flattenCacheKey]flattenCacheValue
+}
+
+type clipMaskCacheKey struct {
+	target    *node
+	reference string
+	ctm       Matrix
+	viewport  ViewBox
+	display   bool
+}
+
+type fillMaskCacheKey struct {
+	path   *Path
+	matrix Matrix
+	rule   fillRule
+}
+
+type geometryCacheKey struct {
+	node     *node
+	viewport ViewBox
+}
+
+type geometryCacheValue struct {
+	path *Path
+	err  error
+}
+
+type flattenCacheKey struct {
+	path      *Path
+	matrix    Matrix
+	tolerance float64
+}
+
+type flattenCacheValue struct {
+	contours []contour
+	err      error
 }
 
 const maxRenderOperations = 1_000_000
@@ -140,183 +132,55 @@ func (r *renderer) step() error {
 	return nil
 }
 
-func (r *renderer) renderNode(dst stddraw.Image, n *node, parentStyle computedStyle, parentCTM Matrix, viewport ViewBox, inheritedOpacity float64) error {
-	if err := r.step(); err != nil {
-		return err
+func (r *renderer) newSampleMask() (*sampleMask, error) {
+	mask := newBudgetedSampleMask(r.bounds, &r.auxiliary)
+	if mask.err != nil {
+		return nil, mask.err
 	}
-	style, err := r.icon.computeStyle(n, parentStyle)
+	return mask, nil
+}
+
+func (r *renderer) geometry(n *node, viewport ViewBox) (*Path, error) {
+	key := geometryCacheKey{node: n, viewport: viewport}
+	if cached, ok := r.geometryCache[key]; ok {
+		return cached.path, cached.err
+	}
+	path, err := n.geometry(viewport)
+	if r.geometryCache == nil {
+		r.geometryCache = make(map[geometryCacheKey]geometryCacheValue)
+	}
+	r.geometryCache[key] = geometryCacheValue{path: path, err: err}
+	return path, err
+}
+
+func (r *renderer) flattenPath(path *Path, matrix Matrix, tolerance float64) ([]contour, error) {
+	key := flattenCacheKey{path: path, matrix: matrix, tolerance: tolerance}
+	if cached, ok := r.flattenCache[key]; ok {
+		return cached.contours, cached.err
+	}
+	contours, err := path.flattenWithBudget(matrix, tolerance, &r.flatten)
+	if r.flattenCache == nil {
+		r.flattenCache = make(map[flattenCacheKey]flattenCacheValue)
+	}
+	r.flattenCache[key] = flattenCacheValue{contours: contours, err: err}
+	return contours, err
+}
+
+func (r *renderer) fillSampleMask(path *Path, matrix Matrix, contours []contour, rule fillRule) (*sampleMask, error) {
+	key := fillMaskCacheKey{path: path, matrix: matrix, rule: rule}
+	if cached := r.fillMaskCache[key]; cached != nil {
+		return cached, nil
+	}
+	maskBounds := pixelBoundsForContours(r.bounds, contours)
+	mask, err := rasterizeClipContours(maskBounds, contours, rule, &r.flatten, &r.auxiliary)
 	if err != nil {
-		return fmt.Errorf("svg: <%s>: %w", n.tag, err)
+		return nil, err
 	}
-	if !style.display {
-		return nil
+	if r.fillMaskCache == nil {
+		r.fillMaskCache = make(map[fillMaskCacheKey]*sampleMask)
 	}
-	ctm := parentCTM.Mul(n.transform)
-	clipSamples, hasClip, err := r.clipMask(n, style, ctm, viewport, make(map[*node]bool))
-	if err != nil {
-		return err
-	}
-	groupOpacity := inheritedOpacity * style.opacity
-	if groupOpacity <= 0 {
-		return nil
-	}
-	if hasClip || groupOpacity < 1 {
-		layer := image.NewNRGBA(r.bounds)
-		if err := r.renderContent(layer, n, style, ctm, viewport); err != nil {
-			return err
-		}
-		var clip *image.Alpha
-		if hasClip {
-			clip = clipSamples.alpha()
-		} else {
-			clip = opaqueMask(r.bounds)
-		}
-		scaleMask(clip, groupOpacity)
-		stddraw.DrawMask(dst, r.bounds, layer, r.bounds.Min, clip, r.bounds.Min, stddraw.Over)
-		return nil
-	}
-	return r.renderContent(dst, n, style, ctm, viewport)
-}
-
-func (r *renderer) renderContent(dst stddraw.Image, n *node, style computedStyle, ctm Matrix, viewport ViewBox) error {
-	if n.unsupported {
-		return nil
-	}
-	switch n.tag {
-	case "defs", "clippath", "lineargradient", "radialgradient", "stop", "title", "desc", "style", "metadata":
-		return nil
-	case "use":
-		ref, ok := referenceID(n.href())
-		if !ok {
-			return nil
-		}
-		target := r.icon.ids[ref]
-		if target == nil || r.useStack[target] {
-			if r.useStack[target] {
-				return fmt.Errorf("svg: cyclic <use> reference to %q", ref)
-			}
-			return nil
-		}
-		if len(r.useStack) >= maxReferenceDepth {
-			return fmt.Errorf("svg: <use> reference depth exceeds %d", maxReferenceDepth)
-		}
-		x, err := parseLength(n.attr("x"), viewport.W)
-		if err != nil {
-			return err
-		}
-		y, err := parseLength(n.attr("y"), viewport.H)
-		if err != nil {
-			return err
-		}
-		r.useStack[target] = true
-		err = r.renderNode(dst, target, style, ctm.Mul(translate(x, y)), viewport, 1)
-		delete(r.useStack, target)
-		return err
-	case "symbol":
-		if !r.useStack[n] {
-			return nil
-		}
-		for _, child := range n.children {
-			if err := r.renderNode(dst, child, style, ctm, viewport, 1); err != nil {
-				return err
-			}
-		}
-		return nil
-	case "path", "rect", "circle", "ellipse", "line", "polyline", "polygon":
-		if !style.visible {
-			return nil
-		}
-		path, err := n.geometry(viewport)
-		if err != nil || path == nil {
-			return err
-		}
-		return r.paintGeometry(dst, path, style, ctm)
-	default:
-		for _, child := range n.children {
-			if err := r.renderNode(dst, child, style, ctm, viewport, 1); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-}
-
-func (r *renderer) paintGeometry(dst stddraw.Image, path *Path, style computedStyle, ctm Matrix) error {
-	contours := path.flatten(ctm, 0.2)
-	localBounds := boundsOfContours(path.flatten(identityMatrix(), 0.1))
-	if style.fill.kind != paintNone {
-		mask := rasterizeContours(r.bounds, contours, style.fillRule)
-		paint, err := r.paintSource(style.fill, style.color, style.fillOpacity, ctm, localBounds)
-		if err != nil {
-			return err
-		}
-		if paint != nil {
-			stddraw.DrawMask(dst, r.bounds, paint, r.bounds.Min, mask, r.bounds.Min, stddraw.Over)
-		}
-	}
-	if style.stroke.kind != paintNone && style.strokeWidth > 0 {
-		mask := rasterizeStroke(r.bounds, path, ctm, style)
-		paint, err := r.paintSource(style.stroke, style.color, style.strokeOpacity, ctm, localBounds)
-		if err != nil {
-			return err
-		}
-		if paint != nil {
-			stddraw.DrawMask(dst, r.bounds, paint, r.bounds.Min, mask, r.bounds.Min, stddraw.Over)
-		}
-	}
-	return nil
-}
-
-func (r *renderer) paintSource(spec paintSpec, current color.NRGBA, opacity float64, ctm Matrix, bounds floatBounds) (image.Image, error) {
-	var value color.NRGBA
-	switch spec.kind {
-	case paintNone:
-		return nil, nil
-	case paintColor:
-		value = spec.color
-	case paintCurrentColor:
-		value = current
-		if r.icon.currentColor != nil {
-			value = *r.icon.currentColor
-		}
-	case paintReference:
-		// Paint servers are resolved in gradients.go. Unknown references make
-		// the paint transparent, as if no paint server were available.
-		return r.gradientSource(spec.ref, opacity, ctm, bounds)
-	default:
-		return nil, nil
-	}
-	value.A = uint8(math.Round(float64(value.A) * math.Max(0, math.Min(1, opacity))))
-	return &boundedUniform{value: value, rgba64: nrgbaToRGBA64(value), bounds: r.bounds}, nil
-}
-
-type boundedUniform struct {
-	value  color.NRGBA
-	rgba64 color.RGBA64
-	bounds image.Rectangle
-}
-
-func (u *boundedUniform) ColorModel() color.Model        { return color.NRGBAModel }
-func (u *boundedUniform) Bounds() image.Rectangle        { return u.bounds }
-func (u *boundedUniform) At(_, _ int) color.Color        { return u.value }
-func (u *boundedUniform) RGBA64At(_, _ int) color.RGBA64 { return u.rgba64 }
-
-func nrgbaToRGBA64(value color.NRGBA) color.RGBA64 {
-	alpha := uint32(value.A)
-	return color.RGBA64{
-		R: uint16(uint32(value.R) * 0x101 * alpha / 0xff),
-		G: uint16(uint32(value.G) * 0x101 * alpha / 0xff),
-		B: uint16(uint32(value.B) * 0x101 * alpha / 0xff),
-		A: uint16(alpha * 0x101),
-	}
-}
-
-func opaqueMask(bounds image.Rectangle) *image.Alpha {
-	mask := image.NewAlpha(bounds)
-	for i := range mask.Pix {
-		mask.Pix[i] = 255
-	}
-	return mask
+	r.fillMaskCache[key] = mask
+	return mask, nil
 }
 
 func referenceID(value string) (string, bool) {
@@ -335,6 +199,10 @@ func (r *renderer) clipMask(target *node, style computedStyle, ctm Matrix, viewp
 	if clip == nil || clip.tag != "clippath" {
 		return nil, false, nil
 	}
+	key := clipMaskCacheKey{target: target, reference: style.clipRef, ctm: ctm, viewport: viewport, display: style.display}
+	if cached := r.clipCache[key]; cached != nil {
+		return cached, true, nil
+	}
 	if visiting[clip] {
 		return nil, false, fmt.Errorf("svg: cyclic clip-path reference to %q", style.clipRef)
 	}
@@ -352,7 +220,14 @@ func (r *renderer) clipMask(target *node, style computedStyle, ctm Matrix, viewp
 			return nil, false, err
 		}
 		if !ok || box.width() == 0 || box.height() == 0 {
-			return newSampleMask(r.bounds), true, nil
+			mask, err := r.newSampleMask()
+			if err == nil {
+				if r.clipCache == nil {
+					r.clipCache = make(map[clipMaskCacheKey]*sampleMask)
+				}
+				r.clipCache[key] = mask
+			}
+			return mask, true, err
 		}
 		base = base.Mul(translate(box.min.X, box.min.Y)).Mul(scale(box.width(), box.height()))
 		clipViewport = ViewBox{W: 1, H: 1}
@@ -366,13 +241,19 @@ func (r *renderer) clipMask(target *node, style computedStyle, ctm Matrix, viewp
 	if err != nil {
 		return nil, false, err
 	}
-	mask := newSampleMask(r.bounds)
+	mask, err := r.newSampleMask()
+	if err != nil {
+		return nil, false, err
+	}
 	for _, child := range clip.children {
 		childMask, err := r.renderClipNode(child, clipStyle, base, clipViewport, visiting, make(map[*node]bool))
 		if err != nil {
 			return nil, false, err
 		}
 		unionSamples(mask, childMask)
+		if mask.err != nil {
+			return nil, false, mask.err
+		}
 	}
 	if clipStyle.hasClip {
 		nested, valid, err := r.clipMask(clip, clipStyle, base, clipViewport, visiting)
@@ -381,8 +262,15 @@ func (r *renderer) clipMask(target *node, style computedStyle, ctm Matrix, viewp
 		}
 		if valid {
 			intersectSamples(mask, nested)
+			if mask.err != nil {
+				return nil, false, mask.err
+			}
 		}
 	}
+	if r.clipCache == nil {
+		r.clipCache = make(map[clipMaskCacheKey]*sampleMask)
+	}
+	r.clipCache[key] = mask
 	return mask, true, nil
 }
 
@@ -391,13 +279,16 @@ func (r *renderer) renderClipNode(n *node, parentStyle computedStyle, parentCTM 
 		return nil, err
 	}
 	if n.unsupported {
-		return newSampleMask(r.bounds), nil
+		return r.newSampleMask()
 	}
 	style, err := r.icon.computeStyle(n, parentStyle)
 	if err != nil {
 		return nil, err
 	}
-	mask := newSampleMask(r.bounds)
+	mask, err := r.newSampleMask()
+	if err != nil {
+		return nil, err
+	}
 	if !style.display {
 		return mask, nil
 	}
@@ -405,12 +296,19 @@ func (r *renderer) renderClipNode(n *node, parentStyle computedStyle, parentCTM 
 	switch n.tag {
 	case "path", "rect", "circle", "ellipse", "polygon", "polyline":
 		if style.visible {
-			path, err := n.geometry(viewport)
+			path, err := r.geometry(n, viewport)
 			if err != nil {
 				return nil, err
 			}
 			if path != nil {
-				mask = rasterizeClipContours(r.bounds, path.flatten(ctm, 0.2), style.clipRule)
+				contours, err := r.flattenPath(path, ctm, 0.2)
+				if err != nil {
+					return nil, err
+				}
+				mask, err = rasterizeClipContours(r.bounds, contours, style.clipRule, &r.flatten, &r.auxiliary)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 	case "use":
@@ -446,6 +344,9 @@ func (r *renderer) renderClipNode(n *node, parentStyle computedStyle, parentCTM 
 				return nil, err
 			}
 			unionSamples(mask, childMask)
+			if mask.err != nil {
+				return nil, mask.err
+			}
 		}
 	}
 	if style.hasClip {
@@ -455,6 +356,9 @@ func (r *renderer) renderClipNode(n *node, parentStyle computedStyle, parentCTM 
 		}
 		if valid {
 			intersectSamples(mask, nested)
+			if mask.err != nil {
+				return nil, mask.err
+			}
 		}
 	}
 	return mask, nil
@@ -538,11 +442,15 @@ func (r *renderer) boundingContent(n *node, style computedStyle, ctm Matrix, vie
 	var box floatBounds
 	switch n.tag {
 	case "path", "rect", "circle", "ellipse", "line", "polyline", "polygon":
-		path, err := n.geometry(viewport)
+		path, err := r.geometry(n, viewport)
 		if err != nil || path == nil {
 			return box, err
 		}
-		for _, contour := range path.flatten(ctm, 0.1) {
+		contours, err := r.flattenPath(path, ctm, 0.1)
+		if err != nil {
+			return box, err
+		}
+		for _, contour := range contours {
 			for _, point := range contour.points {
 				box.add(point)
 			}

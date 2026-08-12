@@ -107,7 +107,7 @@ func TestInvalidCSSClipPathDoesNotEraseValidDeclaration(t *testing.T) {
 	}
 }
 
-func TestRasterxStrokeExtensionsAreLenientOnlyInCompatibilityModes(t *testing.T) {
+func TestInvalidDeclarationsAreLenientOnlyInCompatibilityModes(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -120,6 +120,9 @@ func TestRasterxStrokeExtensionsAreLenientOnlyInCompatibilityModes(t *testing.T)
 		{property: "stroke-linejoin", value: "arc"},
 		{property: "stroke-linejoin", value: "arc-clip"},
 		{property: "stroke-linejoin", value: "arc-limit"},
+		{property: "fill", value: "not-a-color"},
+		{property: "fill-rule", value: "winding"},
+		{property: "stroke-width", value: "-1"},
 	}
 	for _, test := range tests {
 		test := test

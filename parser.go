@@ -62,15 +62,25 @@ func (s *SvgIcon) Warnings() []string {
 }
 
 // SetTarget maps the icon viewBox onto the requested destination rectangle.
-// As in oksvg, the two axes are scaled independently.
+// As in oksvg, the two axes are scaled independently. Non-finite inputs or a
+// non-finite resulting scale select an empty target rather than propagating
+// NaN coordinates into path flattening.
 func (s *SvgIcon) SetTarget(x, y, width, height float64) {
-	if s.ViewBox.W <= 0 || s.ViewBox.H <= 0 || width == 0 || height == 0 {
+	finite := func(value float64) bool { return !math.IsNaN(value) && !math.IsInf(value, 0) }
+	if !finite(x) || !finite(y) || !finite(width) || !finite(height) ||
+		!finite(s.ViewBox.X) || !finite(s.ViewBox.Y) || !finite(s.ViewBox.W) || !finite(s.ViewBox.H) ||
+		s.ViewBox.W <= 0 || s.ViewBox.H <= 0 || width == 0 || height == 0 {
 		s.target = Matrix{}
 		return
 	}
-	s.target = translate(x, y).
+	target := translate(x, y).
 		Mul(scale(width/s.ViewBox.W, height/s.ViewBox.H)).
 		Mul(translate(-s.ViewBox.X, -s.ViewBox.Y))
+	if !finite(target.A) || !finite(target.B) || !finite(target.C) || !finite(target.D) || !finite(target.E) || !finite(target.F) {
+		s.target = Matrix{}
+		return
+	}
+	s.target = target
 }
 
 type node struct {
@@ -108,8 +118,23 @@ const (
 	maxSVGBytes    = 64 << 20
 )
 
+func supportedSVGDoctype(value []byte) bool {
+	normalized := strings.Join(strings.Fields(string(value)), " ")
+	switch normalized {
+	case `DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.0//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd"`,
+		`DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"`,
+		`DOCTYPE svg SYSTEM "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"`:
+		return true
+	default:
+		return false
+	}
+}
+
 // ReadIconStream parses an SVG from stream.
 func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
+	if stream == nil || nilInterface(stream) {
+		return nil, fmt.Errorf("svg: input is nil")
+	}
 	data, err := io.ReadAll(io.LimitReader(stream, maxSVGBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("svg: read input: %w", err)
@@ -135,6 +160,7 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 	decoder.CharsetReader = charset.NewReaderLabel
 	var stack []*node
 	elements := 0
+	pathSegments := 0
 
 	for {
 		token, err := decoder.Token()
@@ -146,7 +172,7 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 		}
 		switch value := token.(type) {
 		case xml.Directive:
-			if bytes.Contains(bytes.ToUpper(value), []byte("DOCTYPE")) {
+			if bytes.Contains(bytes.ToUpper(value), []byte("DOCTYPE")) && !supportedSVGDoctype(value) {
 				return nil, fmt.Errorf("svg: document type declarations are not supported")
 			}
 		case xml.StartElement:
@@ -196,18 +222,35 @@ func ReadIconStream(stream io.Reader, modes ...ErrorMode) (*SvgIcon, error) {
 			}
 			if raw := n.attr("d"); tag == "path" && raw != "" && !n.unsupported {
 				var parseErr error
-				n.path, parseErr = ParsePath(raw)
+				remainingSegments := maxSVGPathSegments - pathSegments
+				if remainingSegments <= 0 {
+					parseErr = fmt.Errorf("%w (maximum %d per SVG)", errPathSegmentLimit, maxSVGPathSegments)
+				} else {
+					n.path, parseErr = parsePath(raw, remainingSegments)
+				}
 				if parseErr != nil {
+					if errors.Is(parseErr, errPathSegmentLimit) {
+						return nil, fmt.Errorf("svg: <path>: %w", parseErr)
+					}
 					if err := icon.handleElementParseError(n, parseErr); err != nil {
 						return nil, err
 					}
+				} else {
+					pathSegments += len(n.path.segments)
 				}
 			}
 			if id := n.attr("id"); id != "" && !n.unsupported {
 				if _, exists := icon.ids[id]; exists {
-					return nil, fmt.Errorf("svg: duplicate id %q", id)
+					message := fmt.Sprintf("duplicate id %q; keeping the first definition", id)
+					if mode == StrictErrorMode {
+						return nil, fmt.Errorf("svg: %s", message)
+					}
+					if mode == WarnErrorMode {
+						icon.addWarning(message, true)
+					}
+				} else {
+					icon.ids[id] = n
 				}
-				icon.ids[id] = n
 			}
 			if len(stack) > 0 {
 				n.parent = stack[len(stack)-1]

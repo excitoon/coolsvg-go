@@ -1,6 +1,7 @@
 package coolsvg
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -191,27 +192,47 @@ type segment struct {
 
 // Path is compiled SVG path geometry.
 type Path struct {
-	segments []segment
+	segments     []segment
+	segmentLimit int
+	parseErr     error
+}
+
+const maxSVGPathSegments = 1_000_000
+
+var errPathSegmentLimit = errors.New("svg path: segment limit exceeded")
+
+func (p *Path) appendSegment(value segment) {
+	if p.parseErr != nil {
+		return
+	}
+	if p.segmentLimit > 0 && len(p.segments) >= p.segmentLimit {
+		p.parseErr = fmt.Errorf("%w (maximum %d)", errPathSegmentLimit, p.segmentLimit)
+		return
+	}
+	p.segments = append(p.segments, value)
 }
 
 func (p *Path) moveTo(v Point) {
-	p.segments = append(p.segments, segment{kind: moveTo, p: [3]Point{v}})
+	p.appendSegment(segment{kind: moveTo, p: [3]Point{v}})
 }
 func (p *Path) lineTo(v Point) {
-	p.segments = append(p.segments, segment{kind: lineTo, p: [3]Point{v}})
+	p.appendSegment(segment{kind: lineTo, p: [3]Point{v}})
 }
 func (p *Path) quadTo(c, v Point) {
-	p.segments = append(p.segments, segment{kind: quadTo, p: [3]Point{c, v}})
+	p.appendSegment(segment{kind: quadTo, p: [3]Point{c, v}})
 }
 func (p *Path) cubicTo(c1, c2, v Point) {
-	p.segments = append(p.segments, segment{kind: cubicTo, p: [3]Point{c1, c2, v}})
+	p.appendSegment(segment{kind: cubicTo, p: [3]Point{c1, c2, v}})
 }
-func (p *Path) close()             { p.segments = append(p.segments, segment{kind: closePath}) }
+func (p *Path) close()             { p.appendSegment(segment{kind: closePath}) }
 func add(a, b Point) Point         { return Point{a.X + b.X, a.Y + b.Y} }
 func sub(a, b Point) Point         { return Point{a.X - b.X, a.Y - b.Y} }
 func mul(a Point, n float64) Point { return Point{a.X * n, a.Y * n} }
-func midpoint(a, b Point) Point    { return Point{(a.X + b.X) / 2, (a.Y + b.Y) / 2} }
+func midpoint(a, b Point) Point    { return Point{a.X/2 + b.X/2, a.Y/2 + b.Y/2} }
 func almostEqual(a, b Point) bool  { return math.Abs(a.X-b.X) < 1e-12 && math.Abs(a.Y-b.Y) < 1e-12 }
+func finitePoint(value Point) bool {
+	return !math.IsNaN(value.X) && !math.IsInf(value.X, 0) && !math.IsNaN(value.Y) && !math.IsInf(value.Y, 0)
+}
 func pointOnEllipse(cx, cy, rx, ry, phi, t float64) Point {
 	return Point{cx + rx*math.Cos(phi)*math.Cos(t) - ry*math.Sin(phi)*math.Sin(t), cy + rx*math.Sin(phi)*math.Cos(t) + ry*math.Cos(phi)*math.Sin(t)}
 }
@@ -221,7 +242,101 @@ type contour struct {
 	closed bool
 }
 
+const (
+	maxRenderFlattenWork   = 2_000_000
+	maxRenderFlattenPoints = 1_000_000
+	maxRenderRasterWork    = 50_000_000
+)
+
+type flattenBudget struct {
+	work              int
+	points            int
+	rasterWork        uint64
+	maximumWork       int
+	maximumPoints     int
+	maximumRasterWork uint64
+}
+
+func newFlattenBudget() flattenBudget {
+	return flattenBudget{
+		maximumWork: maxRenderFlattenWork, maximumPoints: maxRenderFlattenPoints,
+		maximumRasterWork: maxRenderRasterWork,
+	}
+}
+
+func (b *flattenBudget) spendWork() error {
+	if b == nil {
+		return nil
+	}
+	if b.maximumWork == 0 {
+		b.maximumWork = maxRenderFlattenWork
+	}
+	if b.maximumPoints == 0 {
+		b.maximumPoints = maxRenderFlattenPoints
+	}
+	if b.work >= b.maximumWork {
+		return fmt.Errorf("svg: path flattening work exceeds %d operations per render", b.maximumWork)
+	}
+	b.work++
+	return nil
+}
+
+func (b *flattenBudget) spendPoint() error {
+	if b == nil {
+		return nil
+	}
+	if b.maximumPoints == 0 {
+		b.maximumPoints = maxRenderFlattenPoints
+	}
+	if b.points >= b.maximumPoints {
+		return fmt.Errorf("svg: path flattening exceeds %d points per render", b.maximumPoints)
+	}
+	b.points++
+	return nil
+}
+
+func (b *flattenBudget) spendRaster(edges, width, height, samples int) error {
+	if b == nil {
+		return nil
+	}
+	if b.maximumRasterWork == 0 {
+		b.maximumRasterWork = maxRenderRasterWork
+	}
+	if edges < 0 || width < 0 || height < 0 || samples < 0 {
+		return fmt.Errorf("svg: invalid rasterization work dimensions")
+	}
+	multiply := func(left, right uint64) (uint64, bool) {
+		if left != 0 && right > ^uint64(0)/left {
+			return 0, false
+		}
+		return left * right, true
+	}
+	pixels, ok := multiply(uint64(width), uint64(height))
+	if !ok {
+		return fmt.Errorf("svg: rasterization work exceeds %d operations per render", b.maximumRasterWork)
+	}
+	edgeRows, ok := multiply(uint64(edges), uint64(height))
+	if !ok {
+		return fmt.Errorf("svg: rasterization work exceeds %d operations per render", b.maximumRasterWork)
+	}
+	edgeSamples, ok := multiply(edgeRows, uint64(samples))
+	if !ok || pixels > ^uint64(0)-edgeSamples {
+		return fmt.Errorf("svg: rasterization work exceeds %d operations per render", b.maximumRasterWork)
+	}
+	requested := pixels + edgeSamples
+	if b.rasterWork > b.maximumRasterWork || requested > b.maximumRasterWork-b.rasterWork {
+		return fmt.Errorf("svg: rasterization work exceeds %d operations per render", b.maximumRasterWork)
+	}
+	b.rasterWork += requested
+	return nil
+}
+
 func (p *Path) flatten(m Matrix, tolerance float64) []contour {
+	result, _ := p.flattenWithBudget(m, tolerance, nil)
+	return result
+}
+
+func (p *Path) flattenWithBudget(m Matrix, tolerance float64, budget *flattenBudget) ([]contour, error) {
 	if tolerance <= 0 {
 		tolerance = 0.25
 	}
@@ -234,41 +349,73 @@ func (p *Path) flatten(m Matrix, tolerance float64) []contour {
 		}
 		cur = contour{}
 	}
-	appendPoint := func(v Point) {
+	appendPoint := func(v Point) error {
 		v = m.Apply(v)
+		if !finitePoint(v) {
+			return fmt.Errorf("svg: path transform produced non-finite coordinates")
+		}
 		if len(cur.points) == 0 || !almostEqual(cur.points[len(cur.points)-1], v) {
+			if err := budget.spendPoint(); err != nil {
+				return err
+			}
 			cur.points = append(cur.points, v)
 		}
+		return nil
 	}
 	for _, s := range p.segments {
+		if err := budget.spendWork(); err != nil {
+			return nil, err
+		}
 		switch s.kind {
 		case moveTo:
 			flush()
 			here, start = s.p[0], s.p[0]
-			appendPoint(here)
+			if err := appendPoint(here); err != nil {
+				return nil, err
+			}
 		case lineTo:
 			if len(cur.points) == 0 {
-				appendPoint(here)
+				if err := appendPoint(here); err != nil {
+					return nil, err
+				}
 			}
 			here = s.p[0]
-			appendPoint(here)
+			if err := appendPoint(here); err != nil {
+				return nil, err
+			}
 		case quadTo:
 			if len(cur.points) == 0 {
-				appendPoint(here)
+				if err := appendPoint(here); err != nil {
+					return nil, err
+				}
 			}
 			p0, p1, p2 := m.Apply(here), m.Apply(s.p[0]), m.Apply(s.p[1])
-			flattenQuad(&cur.points, p0, p1, p2, tolerance, 0)
+			if !finitePoint(p0) || !finitePoint(p1) || !finitePoint(p2) {
+				return nil, fmt.Errorf("svg: path transform produced non-finite coordinates")
+			}
+			if err := flattenQuad(&cur.points, p0, p1, p2, tolerance, 0, budget); err != nil {
+				return nil, err
+			}
 			here = s.p[1]
 		case cubicTo:
 			if len(cur.points) == 0 {
-				appendPoint(here)
+				if err := appendPoint(here); err != nil {
+					return nil, err
+				}
 			}
 			p0, p1, p2, p3 := m.Apply(here), m.Apply(s.p[0]), m.Apply(s.p[1]), m.Apply(s.p[2])
-			flattenCubic(&cur.points, p0, p1, p2, p3, tolerance, 0)
+			if !finitePoint(p0) || !finitePoint(p1) || !finitePoint(p2) || !finitePoint(p3) {
+				return nil, fmt.Errorf("svg: path transform produced non-finite coordinates")
+			}
+			if err := flattenCubic(&cur.points, p0, p1, p2, p3, tolerance, 0, budget); err != nil {
+				return nil, err
+			}
 			here = s.p[2]
 		case closePath:
 			if len(cur.points) > 0 {
-				appendPoint(start)
+				if err := appendPoint(start); err != nil {
+					return nil, err
+				}
 				cur.closed = true
 			}
 			here = start
@@ -276,38 +423,60 @@ func (p *Path) flatten(m Matrix, tolerance float64) []contour {
 		}
 	}
 	flush()
-	return out
+	return out, nil
 }
 
-func flattenQuad(dst *[]Point, p0, p1, p2 Point, tolerance float64, depth int) {
+func flattenQuad(dst *[]Point, p0, p1, p2 Point, tolerance float64, depth int, budget *flattenBudget) error {
+	if err := budget.spendWork(); err != nil {
+		return err
+	}
 	polygonLength := math.Hypot(p1.X-p0.X, p1.Y-p0.Y) + math.Hypot(p2.X-p1.X, p2.Y-p1.Y)
 	chordLength := math.Hypot(p2.X-p0.X, p2.Y-p0.Y)
+	if math.IsNaN(polygonLength) || math.IsInf(polygonLength, 0) || math.IsNaN(chordLength) || math.IsInf(chordLength, 0) {
+		return fmt.Errorf("svg: path curve produced non-finite geometry")
+	}
 	if depth >= 16 || polygonLength-chordLength <= tolerance {
 		if len(*dst) == 0 || !almostEqual((*dst)[len(*dst)-1], p2) {
+			if err := budget.spendPoint(); err != nil {
+				return err
+			}
 			*dst = append(*dst, p2)
 		}
-		return
+		return nil
 	}
 	a, b := midpoint(p0, p1), midpoint(p1, p2)
 	c := midpoint(a, b)
-	flattenQuad(dst, p0, a, c, tolerance, depth+1)
-	flattenQuad(dst, c, b, p2, tolerance, depth+1)
+	if err := flattenQuad(dst, p0, a, c, tolerance, depth+1, budget); err != nil {
+		return err
+	}
+	return flattenQuad(dst, c, b, p2, tolerance, depth+1, budget)
 }
 
-func flattenCubic(dst *[]Point, p0, p1, p2, p3 Point, tolerance float64, depth int) {
+func flattenCubic(dst *[]Point, p0, p1, p2, p3 Point, tolerance float64, depth int, budget *flattenBudget) error {
+	if err := budget.spendWork(); err != nil {
+		return err
+	}
 	polygonLength := math.Hypot(p1.X-p0.X, p1.Y-p0.Y) + math.Hypot(p2.X-p1.X, p2.Y-p1.Y) + math.Hypot(p3.X-p2.X, p3.Y-p2.Y)
 	chordLength := math.Hypot(p3.X-p0.X, p3.Y-p0.Y)
+	if math.IsNaN(polygonLength) || math.IsInf(polygonLength, 0) || math.IsNaN(chordLength) || math.IsInf(chordLength, 0) {
+		return fmt.Errorf("svg: path curve produced non-finite geometry")
+	}
 	if depth >= 16 || polygonLength-chordLength <= tolerance {
 		if len(*dst) == 0 || !almostEqual((*dst)[len(*dst)-1], p3) {
+			if err := budget.spendPoint(); err != nil {
+				return err
+			}
 			*dst = append(*dst, p3)
 		}
-		return
+		return nil
 	}
 	p01, p12, p23 := midpoint(p0, p1), midpoint(p1, p2), midpoint(p2, p3)
 	p012, p123 := midpoint(p01, p12), midpoint(p12, p23)
 	p0123 := midpoint(p012, p123)
-	flattenCubic(dst, p0, p01, p012, p0123, tolerance, depth+1)
-	flattenCubic(dst, p0123, p123, p23, p3, tolerance, depth+1)
+	if err := flattenCubic(dst, p0, p01, p012, p0123, tolerance, depth+1, budget); err != nil {
+		return err
+	}
+	return flattenCubic(dst, p0123, p123, p23, p3, tolerance, depth+1, budget)
 }
 
 type numberScanner struct {
@@ -401,8 +570,12 @@ func parseNumberList(value string) ([]float64, error) {
 
 // ParsePath compiles SVG path data.
 func ParsePath(data string) (*Path, error) {
+	return parsePath(data, maxSVGPathSegments)
+}
+
+func parsePath(data string, segmentLimit int) (*Path, error) {
 	s := numberScanner{s: data}
-	p := &Path{}
+	p := &Path{segmentLimit: segmentLimit}
 	var cmd byte
 	var here, start, cubicControl, quadControl Point
 	var previous byte
@@ -425,6 +598,9 @@ func ParsePath(data string) (*Path, error) {
 	}
 
 	for {
+		if p.parseErr != nil {
+			return nil, p.parseErr
+		}
 		s.skip()
 		if s.pos >= len(data) {
 			break
@@ -598,6 +774,9 @@ func ParsePath(data string) (*Path, error) {
 		default:
 			return nil, fmt.Errorf("svg path: unsupported command %c", cmd)
 		}
+	}
+	if p.parseErr != nil {
+		return nil, p.parseErr
 	}
 	if len(p.segments) == 0 {
 		return nil, fmt.Errorf("svg path: empty path")

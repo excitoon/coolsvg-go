@@ -310,13 +310,10 @@ func (s *SvgIcon) applyDeclaration(style *computedStyle, parent computedStyle, n
 		return err
 	}
 
-	// rasterx, and therefore oksvg, accepts several non-standard cap and join
-	// extensions. Compatibility mode leaves those invalid declarations at the
-	// inherited value instead of making an otherwise renderable icon fail.
-	property := strings.ToLower(strings.TrimSpace(name))
-	if property != "stroke-linecap" && property != "stroke-linejoin" {
-		return err
-	}
+	// CSS error recovery ignores an invalid declaration while retaining the
+	// preceding cascade value. Compatibility modes follow that rule so a single
+	// unsupported or malformed presentation value cannot make the SVG fail at
+	// render time; strict mode above still reports it.
 	if s.errorMode == WarnErrorMode {
 		s.addWarning(err.Error(), true)
 	}

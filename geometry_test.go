@@ -1,7 +1,9 @@
 package coolsvg
 
 import (
+	"errors"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +105,31 @@ func TestCommandAfterCloseStartsNewContour(t *testing.T) {
 	}
 	if contours[1].points[0] != (Point{}) || contours[1].points[1] != (Point{20, 20}) {
 		t.Fatalf("post-close contour = %#v", contours[1].points)
+	}
+}
+
+func TestParsePathSegmentLimit(t *testing.T) {
+	t.Parallel()
+
+	const source = "M0 0L1 0L2 0L3 0"
+	if _, err := parsePath(source, 3); !errors.Is(err, errPathSegmentLimit) {
+		t.Fatalf("segment-limit error = %v", err)
+	}
+	if _, err := parsePath(source, 4); err != nil {
+		t.Fatalf("path at segment limit failed: %v", err)
+	}
+}
+
+func TestFlattenBudgetRejectsAdversarialCubic(t *testing.T) {
+	t.Parallel()
+
+	path, err := ParsePath("M0 0C1e100 1e100 -1e100 -1e100 1 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := flattenBudget{maximumWork: 64, maximumPoints: 64}
+	if _, err := path.flattenWithBudget(Identity, 0.1, &budget); err == nil || !strings.Contains(err.Error(), "flattening work exceeds 64") {
+		t.Fatalf("adversarial flatten error = %v", err)
 	}
 }
 

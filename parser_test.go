@@ -53,6 +53,45 @@ func TestParserRejectsDoctype(t *testing.T) {
 	}
 }
 
+func TestParserAcceptsStandardExternalSVGDoctypeWithoutResolvingIt(t *testing.T) {
+	t.Parallel()
+
+	for _, declaration := range []string{
+		`<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.0//EN" "http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd">`,
+		`<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" >`,
+		`<!DOCTYPE svg SYSTEM "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">`,
+	} {
+		if _, err := ReadIconStream(strings.NewReader(declaration + `<svg viewBox="0 0 10 10"/>`)); err != nil {
+			t.Fatalf("standard SVG doctype %q: %v", declaration, err)
+		}
+	}
+
+	malicious := `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd" [<!ENTITY x "expanded">]><svg viewBox="0 0 1 1"><title>&x;</title></svg>`
+	if _, err := ReadIconStream(strings.NewReader(malicious)); err == nil || !strings.Contains(err.Error(), "document type") {
+		t.Fatalf("internal-subset doctype error = %v", err)
+	}
+}
+
+func TestParserDuplicateIDFollowsErrorModeAndKeepsFirstDefinition(t *testing.T) {
+	t.Parallel()
+
+	const source = `<svg viewBox="0 0 1 1"><defs><rect id="shape" width="1" height="1" fill="red"/><rect id="shape" width="1" height="1" fill="blue"/></defs><use href="#shape"/></svg>`
+	if _, err := ReadIconStream(strings.NewReader(source), StrictErrorMode); err == nil || !strings.Contains(err.Error(), "duplicate id") {
+		t.Fatalf("strict duplicate-id error = %v", err)
+	}
+	icon, err := ReadIconStream(strings.NewReader(source), IgnoreErrorMode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	if err := icon.Render(destination); err != nil {
+		t.Fatal(err)
+	}
+	if got := destination.NRGBAAt(0, 0); got != (color.NRGBA{R: 255, A: 255}) {
+		t.Fatalf("duplicate-id reference = %#v, want first red definition", got)
+	}
+}
+
 func TestReadIconStreamDecodesLegacyXMLCharset(t *testing.T) {
 	t.Parallel()
 

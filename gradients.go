@@ -2,7 +2,6 @@ package coolsvg
 
 import (
 	"fmt"
-	"image"
 	"image/color"
 	"math"
 	"slices"
@@ -12,6 +11,7 @@ import (
 type gradientStop struct {
 	offset float64
 	color  color.NRGBA
+	alpha  float64
 }
 
 type gradientDefinition struct {
@@ -21,33 +21,20 @@ type gradientDefinition struct {
 	transform Matrix
 	values    map[string]string
 	stops     []gradientStop
+	geometry  gradientGeometry
 }
 
-type gradientImage struct {
-	definition gradientDefinition
-	inverse    Matrix
-	opacity    float64
-	bounds     image.Rectangle
-}
-
-func (g *gradientImage) ColorModel() color.Model { return color.NRGBAModel }
-func (g *gradientImage) Bounds() image.Rectangle { return g.bounds }
-
-func (g *gradientImage) At(x, y int) color.Color {
-	return g.colorAt(x, y)
-}
-
-// RGBA64At lets image/draw avoid allocating a color interface value for every
-// gradient pixel.
-func (g *gradientImage) RGBA64At(x, y int) color.RGBA64 {
-	return nrgbaToRGBA64(g.colorAt(x, y))
-}
-
-func (g *gradientImage) colorAt(x, y int) color.NRGBA {
-	value := gradientValueAt(g.definition, g.inverse, x, y)
-	result := interpolateStops(g.definition.stops, value)
-	result.A = uint8(math.Round(float64(result.A) * g.opacity))
-	return result
+type gradientGeometry struct {
+	x1 float64
+	y1 float64
+	x2 float64
+	y2 float64
+	cx float64
+	cy float64
+	fx float64
+	fy float64
+	r  float64
+	fr float64
 }
 
 // gradientValueAt evaluates the shared geometry and spread rules used by both
@@ -55,23 +42,18 @@ func (g *gradientImage) colorAt(x, y int) color.NRGBA {
 func gradientValueAt(definition gradientDefinition, inverse Matrix, x, y int) float64 {
 	p := inverse.Apply(Point{X: float64(x) + 0.5, Y: float64(y) + 0.5})
 	value := 0.0
+	geometry := definition.geometry
 	if definition.kind == "lineargradient" {
-		x1, y1 := definition.number("x1"), definition.number("y1")
-		x2, y2 := definition.number("x2"), definition.number("y2")
-		dx, dy := x2-x1, y2-y1
+		dx, dy := geometry.x2-geometry.x1, geometry.y2-geometry.y1
 		denominator := dx*dx + dy*dy
 		if denominator > 0 {
-			value = ((p.X-x1)*dx + (p.Y-y1)*dy) / denominator
+			value = ((p.X-geometry.x1)*dx + (p.Y-geometry.y1)*dy) / denominator
 		}
 	} else {
-		cx, cy := definition.number("cx"), definition.number("cy")
-		fx, fy := definition.number("fx"), definition.number("fy")
-		radius := definition.number("r")
-		fr := definition.number("fr")
-		dx, dy := p.X-fx, p.Y-fy
+		dx, dy := p.X-geometry.fx, p.Y-geometry.fy
 		a := dx*dx + dy*dy
-		b := 2 * (dx*(fx-cx) + dy*(fy-cy))
-		c := (fx-cx)*(fx-cx) + (fy-cy)*(fy-cy) - radius*radius
+		b := 2 * (dx*(geometry.fx-geometry.cx) + dy*(geometry.fy-geometry.cy))
+		c := (geometry.fx-geometry.cx)*(geometry.fx-geometry.cx) + (geometry.fy-geometry.cy)*(geometry.fy-geometry.cy) - geometry.r*geometry.r
 		discriminant := b*b - 4*a*c
 		if a > 0 && discriminant >= 0 {
 			u := (-b + math.Sqrt(discriminant)) / (2 * a)
@@ -81,7 +63,7 @@ func gradientValueAt(definition gradientDefinition, inverse Matrix, x, y int) fl
 			if u > 0 {
 				distance := math.Sqrt(a)
 				outer := distance * u
-				value = (distance - fr) / math.Max(outer-fr, 1e-15)
+				value = (distance - geometry.fr) / math.Max(outer-geometry.fr, 1e-15)
 			}
 		}
 	}
@@ -91,39 +73,6 @@ func gradientValueAt(definition gradientDefinition, inverse Matrix, x, y int) fl
 func (g gradientDefinition) number(name string) float64 {
 	value, _ := parseLength(g.values[name], 1)
 	return value
-}
-
-func (r *renderer) gradientSource(ref string, opacity float64, ctm Matrix, bounds floatBounds) (image.Image, error) {
-	n := r.icon.ids[ref]
-	if n == nil || n.tag != "lineargradient" && n.tag != "radialgradient" {
-		return nil, nil
-	}
-	definition, err := r.resolveGradient(n, make(map[*node]bool))
-	if err != nil {
-		return nil, err
-	}
-	definition = normalizeGradientDefinition(definition, r.icon.ViewBox)
-	if len(definition.stops) == 0 {
-		return nil, nil
-	}
-	matrix := ctm
-	if definition.units == "objectboundingbox" {
-		if !bounds.valid || bounds.width() == 0 || bounds.height() == 0 {
-			return nil, nil
-		}
-		matrix = matrix.Mul(translate(bounds.min.X, bounds.min.Y)).Mul(scale(bounds.width(), bounds.height()))
-	}
-	matrix = matrix.Mul(definition.transform)
-	inverse, ok := matrix.inverse()
-	if !ok {
-		return nil, nil
-	}
-	return &gradientImage{
-		definition: definition,
-		inverse:    inverse,
-		opacity:    math.Max(0, math.Min(1, opacity)),
-		bounds:     r.bounds,
-	}, nil
 }
 
 func (r *renderer) resolveGradient(n *node, visiting map[*node]bool) (gradientDefinition, error) {
@@ -210,6 +159,13 @@ func normalizeGradientDefinition(definition gradientDefinition, viewport ViewBox
 			definition.values[name] = normalizeGradientLength(value, definition.units, name, viewport)
 		}
 	}
+	definition.geometry = gradientGeometry{
+		x1: definition.number("x1"), y1: definition.number("y1"),
+		x2: definition.number("x2"), y2: definition.number("y2"),
+		cx: definition.number("cx"), cy: definition.number("cy"),
+		fx: definition.number("fx"), fy: definition.number("fy"),
+		r: definition.number("r"), fr: definition.number("fr"),
+	}
 	return definition
 }
 
@@ -273,8 +229,9 @@ func (r *renderer) readGradientStops(n *node) ([]gradientStop, error) {
 				stopColor = *r.icon.currentColor
 			}
 		}
-		stopColor.A = uint8(math.Round(float64(stopColor.A) * style.stopOpacity))
-		stops = append(stops, gradientStop{offset: offset, color: stopColor})
+		alpha := float64(stopColor.A) / 255 * style.stopOpacity
+		stopColor.A = uint8(math.Round(alpha * 255))
+		stops = append(stops, gradientStop{offset: offset, color: stopColor, alpha: alpha})
 	}
 	slices.SortStableFunc(stops, func(a, b gradientStop) int {
 		if a.offset < b.offset {
@@ -304,29 +261,4 @@ func spreadGradient(value float64, spread string) float64 {
 		value = math.Max(0, math.Min(1, value))
 	}
 	return value
-}
-
-func interpolateStops(stops []gradientStop, value float64) color.NRGBA {
-	if len(stops) == 0 {
-		return color.NRGBA{}
-	}
-	if value <= stops[0].offset {
-		return stops[0].color
-	}
-	for i := 1; i < len(stops); i++ {
-		if value <= stops[i].offset {
-			span := stops[i].offset - stops[i-1].offset
-			if span <= 0 {
-				return stops[i].color
-			}
-			t := (value - stops[i-1].offset) / span
-			return mixColor(stops[i-1].color, stops[i].color, t)
-		}
-	}
-	return stops[len(stops)-1].color
-}
-
-func mixColor(a, b color.NRGBA, t float64) color.NRGBA {
-	mix := func(x, y uint8) uint8 { return uint8(math.Round(float64(x)*(1-t) + float64(y)*t)) }
-	return color.NRGBA{R: mix(a.R, b.R), G: mix(a.G, b.G), B: mix(a.B, b.B), A: mix(a.A, b.A)}
 }
