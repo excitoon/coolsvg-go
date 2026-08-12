@@ -11,6 +11,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,8 +25,8 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|1)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$ ]]; then
-            echo "release tag must be SemVer v0.x.y or v1.x.y" >&2
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$ ]]; then
+            echo "release tag must be SemVer with a v prefix" >&2
             exit 1
           fi
 
@@ -36,6 +37,7 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+          go mod verify
 
       - name: Vet
         run: go vet -mod=readonly ./...
@@ -44,6 +46,11 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...
+
+      - name: Scan reachable vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
 
       - name: Test with race detector
         run: go test -mod=readonly -race ./...
@@ -56,6 +63,7 @@ jobs:
   build:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +108,7 @@ jobs:
             export GOEXPERIMENT=simd
           fi
           go build -mod=readonly -trimpath -ldflags="-s -w" -o "$stage/$executable" ./cmd/coolsvg
-          cp LICENSE.md README.md "$stage/"
+          cp LICENSE.md README.md THIRD_PARTY_LICENSES.md "$stage/"
           if [ "$GOOS" = windows ]; then
             (cd build && zip -r "../release/${archive}.zip" "$archive")
           else
@@ -117,6 +125,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
 
@@ -137,26 +146,52 @@ jobs:
           RELEASE_TOKEN: ${{ github.token }}
         shell: bash
         run: |
+          set -euo pipefail
           prerelease=false
           tag_without_metadata="${GITHUB_REF_NAME%%+*}"
           if [[ "$tag_without_metadata" == *-* ]]; then
             prerelease=true
           fi
-          payload="$(jq -n \
-            --arg tag "$GITHUB_REF_NAME" \
-            --argjson prerelease "$prerelease" \
-            '{tag_name: $tag, name: $tag, generate_release_notes: true, prerelease: $prerelease}')"
-          response="$(curl --fail-with-body --silent --show-error \
-            --request POST \
+          encoded_tag="$(jq -rn --arg value "$GITHUB_REF_NAME" '$value | @uri')"
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+          status="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
             --header "Accept: application/vnd.github+json" \
             --header "Authorization: Bearer ${RELEASE_TOKEN}" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases" \
-            --data "$payload")"
-          upload_url="$(jq -r '.upload_url | sub("\\{.*$"; "")' <<<"$response")"
-          test -n "$upload_url"
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${encoded_tag}")"
+          case "$status" in
+            200)
+              response="$(<"$response_file")"
+              ;;
+            404)
+              payload="$(jq -n \
+                --arg tag "$GITHUB_REF_NAME" \
+                --argjson prerelease "$prerelease" \
+                '{tag_name: $tag, name: $tag, generate_release_notes: true, prerelease: $prerelease, draft: true}')"
+              response="$(curl --fail-with-body --silent --show-error \
+                --request POST \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer ${RELEASE_TOKEN}" \
+                --header "Content-Type: application/json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases" \
+                --data "$payload")"
+              ;;
+            *)
+              cat "$response_file" >&2
+              exit 1
+              ;;
+          esac
+          release_id="$(jq -er '.id | tostring' <<<"$response")"
+          upload_url="$(jq -er '.upload_url | sub("\\{.*$"; "")' <<<"$response")"
           for asset in release/*; do
             name="${asset##*/}"
+            if jq -e --arg name "$name" '.assets[]? | select(.name == $name)' <<<"$response" >/dev/null; then
+              continue
+            fi
             encoded_name="$(jq -rn --arg value "$name" '$value | @uri')"
             curl --fail-with-body --silent --show-error \
               --request POST \
@@ -167,3 +202,15 @@ jobs:
               "${upload_url}?name=${encoded_name}" \
               --data-binary "@${asset}" >/dev/null
           done
+          publish_payload="$(jq -n \
+            --arg name "$GITHUB_REF_NAME" \
+            --argjson prerelease "$prerelease" \
+            '{name: $name, prerelease: $prerelease, draft: false}')"
+          curl --fail-with-body --silent --show-error \
+            --request PATCH \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${RELEASE_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            --data "$publish_payload" >/dev/null

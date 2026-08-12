@@ -16,6 +16,7 @@ jobs:
   test:
     name: Go ${{ matrix.go-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +41,7 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code -- go.mod go.sum
+          go mod verify
 
       - name: Vet
         run: go vet -mod=readonly ./...
@@ -48,6 +50,24 @@ jobs:
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
           staticcheck ./...
+
+      - name: Lint workflows
+        if: matrix.go-version == '1.26.x'
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          actionlint
+
+      - name: Scan reachable vulnerabilities
+        if: matrix.go-version == '1.26.x'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
+      - name: Fuzz smoke tests
+        if: matrix.go-version == '1.26.x'
+        run: |
+          go test -run='^$' -fuzz=FuzzParsePath -fuzztime=5s .
+          go test -run='^$' -fuzz=FuzzReadAndRenderSVG -fuzztime=5s .
 
       - name: Test with race detector
         run: go test -mod=readonly -race ./...
@@ -58,6 +78,7 @@ jobs:
   simd:
     name: Go 1.26 SIMD
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       GOEXPERIMENT: simd
 
@@ -73,3 +94,34 @@ jobs:
 
       - name: Test SIMD build
         run: go test -mod=readonly ./...
+
+  cross-build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.26.x
+          cache-dependency-path: go.sum
+
+      - name: Build packages
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          if [ "$GOARCH" = amd64 ]; then
+            export GOEXPERIMENT=simd
+          fi
+          go build -mod=readonly ./...
